@@ -133,6 +133,14 @@ function maskKey(key) {
     return key.slice(0, 6) + '••••••••' + key.slice(-4);
 }
 
+function maskKeyForLog(key) {
+    if (!key || key.length < 12) return '****';
+    const head = key.slice(0, 6);
+    const tail = key.slice(-6);
+    const stars = '*'.repeat(Math.max(4, key.length - 12));
+    return head + stars + tail;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // KEY STATE
 // ─────────────────────────────────────────────────────────────────────────────
@@ -170,9 +178,12 @@ async function saveKeyState(env, kid, state) {
 
 async function resetKeyState(env, kid) {
     const s = await getKeyState(env, kid);
-    // 仅重置每日计数与封禁状态，保留历史累计数据
+    // 手动重置：清空当日与累计统计以及模型级明细，恢复为"全新"状态
     s.daily_calls     = 0;
     s.daily_errors    = 0;
+    s.total_calls     = 0;
+    s.total_errors    = 0;
+    s.model_stats     = {};
     s.exhausted_until = null;
     s.exhausted_by_model = {};
     s.last_reset      = Date.now();
@@ -661,7 +672,7 @@ async function proxyToGemini(req, env, targetPath, maxRetries = 3, ctx) {
                 else await onKeyError(env, kid, state, 429, modelShort);
                 logBuffer.push({ ts: Date.now(), path: targetPath, method: req.method,
                     model: originalModel || modelShort || null, status: 429,
-                    input: logInput, redirect: url.toString() });
+                    input: logInput, redirect: url.toString(), api_key: maskKeyForLog(key) });
                 continue;
             }
 
@@ -676,7 +687,7 @@ async function proxyToGemini(req, env, targetPath, maxRetries = 3, ctx) {
             // 日志优先展示"用户请求的原始模型"，而非代理内部回退/归一化后的模型
             logBuffer.push({ ts: Date.now(), path: targetPath, method: req.method,
                 model: originalModel || (parsedBody && parsedBody.model) || null,
-                status: resp.status, input: logInput, redirect: url.toString() });
+                status: resp.status, input: logInput, redirect: url.toString(), api_key: maskKeyForLog(key) });
 
             const outHeaders = new Headers(resp.headers);
             outHeaders.set('Access-Control-Allow-Origin',  '*');
@@ -1397,7 +1408,7 @@ gemini "你好！"</pre>
                 </div>
                 <div style="padding:18px;max-height:70vh;overflow:auto">
                     <table>
-                        <thead><tr><th>时间</th><th>路径</th><th>模型</th><th>状态</th><th>输入</th><th>重定向</th></tr></thead>
+                        <thead><tr><th>时间</th><th>路径</th><th>模型</th><th>状态</th><th>输入</th><th>API Key</th></tr></thead>
                         <tbody id="log-tbody"><tr class="empty-row"><td colspan="6">加载中…</td></tr></tbody>
                     </table>
                 </div>
@@ -1539,8 +1550,8 @@ function renderKeys(d){
         if(k.models && k.models.length){
             mstats=k.models.map(function(m){
                 var flag=m.exhausted?'⚠ ':'';
-                return flag+escapeHtml(m.model)+': '+(m.total_calls||0)+' / '+(m.total_errors||0);
-            }).join('<br/>');
+                return '<div style="margin-bottom:0.125rem">'+flag+escapeHtml(m.model)+': '+(m.total_calls||0)+' / '+(m.total_errors||0)+'</div>';
+            }).join('');
         }else{
             mstats='—';
         }
@@ -1767,9 +1778,17 @@ function renderLogs(logs) {
         var statusCls = e.status >= 400 ? 'nr' : 'ng';
         var istr = e.input != null && String(e.input) !== '' ? String(e.input) : '';
         var ostr = e.redirect != null && String(e.redirect) !== '' ? String(e.redirect) : '';
+        var kstr = e.api_key != null && String(e.api_key) !== '' ? String(e.api_key) : '';
         var inputD = istr ? escapeHtml(istr.slice(0, 120)) + (istr.length > 120 ? '…' : '') : '—';
-        var outputD = ostr ? escapeHtml(ostr.slice(0, 120)) + (ostr.length > 120 ? '…' : '') : '—';
-        return '<tr><td class="ts">' + ts + '</td><td class="mono">' + escapeHtml(e.path || '—') + '</td><td class="monohi">' + escapeHtml(e.model || '—') + '</td><td class="num ' + statusCls + '">' + (e.status || '—') + '</td><td class="mono" style="max-width:200px;overflow:hidden;text-overflow:ellipsis" title="' + escapeHtml(istr) + '">' + inputD + '</td><td class="mono" style="max-width:200px;overflow:hidden;text-overflow:ellipsis" title="' + escapeHtml(ostr) + '">' + outputD + '</td></tr>';
+        var keyD = kstr ? escapeHtml(kstr) : '—';
+        return '<tr>'
+            + '<td class="ts">' + ts + '</td>'
+            + '<td class="mono" style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + escapeHtml(e.path || '—') + '">' + escapeHtml(e.path || '—') + '</td>'
+            + '<td class="monohi">' + escapeHtml(e.model || '—') + '</td>'
+            + '<td class="num ' + statusCls + '">' + (e.status || '—') + '</td>'
+            + '<td class="mono" style="max-width:200px;overflow:hidden;text-overflow:ellipsis" title="' + escapeHtml(istr) + '">' + inputD + '</td>'
+            + '<td class="mono" style="max-width:200px;overflow:hidden;text-overflow:ellipsis" title="' + escapeHtml(kstr) + '">' + keyD + '</td>'
+            + '</tr>';
     }).join('');
 }
 
