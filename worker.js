@@ -32,6 +32,10 @@ const KV_KEY_SUPPORTED_MODELS     = 'cfg:supported_models_raw';
 const KV_KEY_SUPPORTED_FETCHED_AT = 'cfg:supported_models_fetched_at';
 const KV_KEY_FALLBACK_MODELS      = 'cfg:fallback_models';
 const KV_KEY_LOG_ENTRIES          = 'log:entries';
+// cfg:token_index 存储所有 thash 的数组，用 kvGet/kvSet 维护，
+// 绕过 CF Workers KV list 操作的最终一致性延迟（最长 60s），
+// 从根本上解决令牌列表不显示的问题。
+const KV_KEY_TOKEN_INDEX          = 'cfg:token_index';
 const KV_KEY_ROUND_ROBIN_INDEX    = 'rr_idx';
 const KV_PREFIX_KEYSTATE          = 'ks:';
 const KV_PREFIX_TOKEN             = 'tok:';
@@ -314,30 +318,62 @@ function maskTokenForPreview(token) {
     return token.slice(0, 6) + '••••••••••' + token.slice(-6);
 }
 
+// ── Token Index helpers ─────────────────────────────────────────────────────
+// CF Workers KV 的 list() 操作是最终一致的（最多延迟 60s），
+// 导致刚创建的 token 无法立即在列表中显示。
+// 解决方案：用一个独立索引 key（cfg:token_index）维护所有 thash 的数组，
+// 读写均走 kvGet / kvSet（强一致），彻底绕过 kvList 的一致性问题。
+
+async function getTokenIndex(env) {
+    const raw = await kvGet(env, KV_KEY_TOKEN_INDEX);
+    return Array.isArray(raw) ? raw : [];
+}
+
+async function addToTokenIndex(env, thash) {
+    const index = await getTokenIndex(env);
+    if (!index.includes(thash)) {
+        index.push(thash);
+        await kvSet(env, KV_KEY_TOKEN_INDEX, index);
+    }
+}
+
+async function removeFromTokenIndex(env, thash) {
+    const index = await getTokenIndex(env);
+    const updated = index.filter(h => h !== thash);
+    await kvSet(env, KV_KEY_TOKEN_INDEX, updated);
+}
+
 /** rate_limit_sec: 最小访问间隔（秒），0=不限制，默认 10 */
 async function createToken(env, label, rateLimitSec) {
     const token = generateToken();
     const thash = await tokenHash(token);
     const sec   = rateLimitSec === 0 ? 0 : (Math.max(0, Math.min(3600, parseInt(rateLimitSec, 10) || 10)));
     const data  = { label: label || 'Token', created_at: Date.now(), last_used: null, calls: 0, rate_limit_sec: sec, token_preview: maskTokenForPreview(token) };
+    // 同时写入 token 数据与索引，两者均使用强一致的 kvSet
     await kvSet(env, KV_PREFIX_TOKEN + thash, data);
+    await addToTokenIndex(env, thash);
     return { token, thash, ...data };
 }
 
 async function listTokens(env) {
-    const keys = await kvList(env, KV_PREFIX_TOKEN);
-    if (!keys.length) return [];
-    const results = await Promise.all(keys.map(k => kvGet(env, k.name)));
+    // 从索引读取所有 thash（kvGet，强一致），再并发拉取每个 token 的数据
+    const thashes = await getTokenIndex(env);
+    if (!thashes.length) return [];
+    const results = await Promise.all(thashes.map(h => kvGet(env, KV_PREFIX_TOKEN + h)));
     const tokens  = [];
-    for (let i = 0; i < keys.length; i++) {
+    for (let i = 0; i < thashes.length; i++) {
         const data = results[i];
-        if (data) tokens.push({ thash: keys[i].name.replace(KV_PREFIX_TOKEN, ''), ...data });
+        // data 为 null 表示该 token 已被直接删除但索引未清理，跳过即可
+        if (data) tokens.push({ thash: thashes[i], ...data });
     }
     return tokens.sort((a, b) => b.created_at - a.created_at);
 }
 
 async function revokeToken(env, thash) {
-    await kvDelete(env, KV_PREFIX_TOKEN + thash);
+    await Promise.all([
+        kvDelete(env, KV_PREFIX_TOKEN + thash),
+        removeFromTokenIndex(env, thash),
+    ]);
 }
 
 /** @returns {{ ok: boolean, message?: string, statusCode?: number }} */
