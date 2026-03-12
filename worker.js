@@ -579,6 +579,7 @@ async function handleApiKeysPost(req, env) {
     const key = (body.key || '').trim();
     if (!key) return jsonError('请提供 key', 400);
     const keys = await getApiKeys(env);
+    if (keys.includes(key)) return jsonResp({ ok: false, error: '该 API Key 已存在' }, 400);
     keys.push(key);
     await setApiKeys(env, keys);
     return jsonResp({ ok: true, keys: keys.map((k, i) => ({ index: i, masked: maskKey(k) })) });
