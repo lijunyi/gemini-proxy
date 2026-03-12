@@ -19,12 +19,24 @@
   */
 
 // ─────────────────────────────────────────────────────────────────────────────
-// CONSTANTS
+// CONSTANTS & KV KEYS
 // ─────────────────────────────────────────────────────────────────────────────
 
 const GEMINI_BASE = 'https://generativelanguage.googleapis.com';
 const COOKIE_NAME = 'gproxy_sess';
 const DAY_MS      = 86_400_000;
+
+// KV key names & prefixes（统一管理，便于后续维护）
+const KV_KEY_API_KEYS             = 'cfg:api_keys';
+const KV_KEY_SUPPORTED_MODELS     = 'cfg:supported_models_raw';
+const KV_KEY_SUPPORTED_FETCHED_AT = 'cfg:supported_models_fetched_at';
+const KV_KEY_FALLBACK_MODELS      = 'cfg:fallback_models';
+const KV_KEY_LOG_ENTRIES          = 'log:entries';
+const KV_KEY_ROUND_ROBIN_INDEX    = 'rr_idx';
+const KV_PREFIX_KEYSTATE          = 'ks:';
+const KV_PREFIX_TOKEN             = 'tok:';
+const KV_PREFIX_RATE_LIMIT        = 'rl:';
+const KV_PREFIX_SESSION           = 'sess:';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SECURITY HELPERS
@@ -92,17 +104,15 @@ async function kvList(env, prefix) {
 // API KEYS (stored in KV, configured in panel)
 // ─────────────────────────────────────────────────────────────────────────────
 
-const CFG_KEYS_KEY = 'cfg:api_keys';
-
 async function getApiKeys(env) {
-    const raw = await kvGet(env, CFG_KEYS_KEY);
+    const raw = await kvGet(env, KV_KEY_API_KEYS);
     if (Array.isArray(raw)) return raw.filter(k => typeof k === 'string' && k.trim());
     return [];
 }
 
 async function setApiKeys(env, keys) {
     const list = Array.isArray(keys) ? keys.filter(k => typeof k === 'string' && k.trim()) : [];
-    await kvSet(env, CFG_KEYS_KEY, list);
+    await kvSet(env, KV_KEY_API_KEYS, list);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -131,16 +141,27 @@ const DEFAULT_STATE = () => ({
     last_used:       null,
     last_error:      null,
     last_error_code: null,
-    exhausted_until: null,
+    exhausted_until: null,          // Key 级别的耗尽截止时间（在没有模型信息时使用）
+    exhausted_by_model: {},         // 模型级别的耗尽截止时间（short name → ts）
+    model_stats:     {},            // 每个模型的累计调用与错误统计（short name → { total_calls, total_errors }）
     last_reset:      Date.now(),
 });
 
 async function getKeyState(env, kid) {
-    return (await kvGet(env, 'ks:' + kid)) || DEFAULT_STATE();
+    const raw = (await kvGet(env, KV_PREFIX_KEYSTATE + kid)) || DEFAULT_STATE();
+    // 防御性校验：确保字段存在且类型正确，避免 KV 中异常数据导致崩溃
+    if (!raw || typeof raw !== 'object') return DEFAULT_STATE();
+    if (!('exhausted_by_model' in raw) || typeof raw.exhausted_by_model !== 'object' || raw.exhausted_by_model === null) {
+        raw.exhausted_by_model = {};
+    }
+    if (!('model_stats' in raw) || typeof raw.model_stats !== 'object' || raw.model_stats === null) {
+        raw.model_stats = {};
+    }
+    return raw;
 }
 
 async function saveKeyState(env, kid, state) {
-    await kvSet(env, 'ks:' + kid, state);
+    await kvSet(env, KV_PREFIX_KEYSTATE + kid, state);
 }
 
 async function resetKeyState(env, kid) {
@@ -149,6 +170,7 @@ async function resetKeyState(env, kid) {
     s.daily_calls     = 0;
     s.daily_errors    = 0;
     s.exhausted_until = null;
+    s.exhausted_by_model = {};
     s.last_reset      = Date.now();
     await saveKeyState(env, kid, s);
 }
@@ -157,55 +179,115 @@ async function resetKeyState(env, kid) {
 // KEY ROTATION
 // ─────────────────────────────────────────────────────────────────────────────
 
-async function pickKey(env) {
+/**
+ * 选择一个可用的 API Key。
+ * @param {any} env
+ * @param {string|null} modelShort 当前请求使用的模型 short name（如 "gemini-2.5-pro"），用于按模型维度跳过已耗尽的 key。
+ */
+async function pickKey(env, modelShort = null) {
     const keys = await getApiKeys(env);
     if (!keys.length) throw new Error('No API keys configured');
     const now = Date.now();
 
-    let idx = (await kvGet(env, 'rr_idx')) ?? 0;
+    let idx = (await kvGet(env, KV_KEY_ROUND_ROBIN_INDEX)) ?? 0;
     if (typeof idx !== 'number' || isNaN(idx)) idx = 0;
 
-    for (let i = 0; i < keys.length; i++) {
-        const pos = (idx + i) % keys.length;
-        const key = keys[pos];
-        const kid = await keyHash(key);
-        let state = await getKeyState(env, kid);
+    // 并发预取所有 Key 的 hash 与状态，避免串行 KV 读（Fix #5）
+    const kids   = await Promise.all(keys.map(k => keyHash(k)));
+    const states = await Promise.all(kids.map(kid => getKeyState(env, kid)));
 
-        // Auto daily reset
+    // 自动每日重置：并发写入所有需要重置的 Key，不阻塞主流程
+    const resetPromises = [];
+    for (let i = 0; i < keys.length; i++) {
+        const state = states[i];
         if (state.last_reset && (now - state.last_reset) >= DAY_MS) {
-            state.daily_calls     = 0;
-            state.daily_errors    = 0;
-            state.last_reset      = now;
-            state.exhausted_until = null;
-            await saveKeyState(env, kid, state);
+            state.daily_calls        = 0;
+            state.daily_errors       = 0;
+            state.last_reset         = now;
+            state.exhausted_until    = null;
+            state.exhausted_by_model = {};
+            resetPromises.push(saveKeyState(env, kids[i], state));
+        }
+    }
+    if (resetPromises.length) await Promise.all(resetPromises);
+
+    // 找第一个可用 Key（round-robin 起点）
+    for (let i = 0; i < keys.length; i++) {
+        const pos   = (idx + i) % keys.length;
+        const state = states[pos];
+
+        // 优先按模型维度判断是否已耗尽；若未提供模型名，则使用 Key 级别的 exhausted_until
+        if (modelShort && state.exhausted_by_model && typeof state.exhausted_by_model === 'object') {
+            const ts = state.exhausted_by_model[modelShort];
+            if (typeof ts === 'number' && ts > now) continue;
+        } else if (state.exhausted_until && state.exhausted_until > now) {
+            continue;
         }
 
-        if (state.exhausted_until && state.exhausted_until > now) continue;
-
-        await kvSet(env, 'rr_idx', (pos + 1) % keys.length);
-        return { key, kid, state, pos };
+        await kvSet(env, KV_KEY_ROUND_ROBIN_INDEX, (pos + 1) % keys.length);
+        return { key: keys[pos], kid: kids[pos], state, pos };
     }
 
-    // All exhausted — return first anyway
-    const key   = keys[0];
-    const kid   = await keyHash(key);
-    const state = await getKeyState(env, kid);
-    return { key, kid, state, pos: 0 };
+    // 全部耗尽：仍按 round-robin 顺序返回（Fix #1），确保调用方每次重试拿到不同的 Key，
+    // 而不是每次都打到 keys[0]，让上层日志可以完整记录每个 Key 的 429。
+    const pos = idx % keys.length;
+    await kvSet(env, KV_KEY_ROUND_ROBIN_INDEX, (pos + 1) % keys.length);
+    return { key: keys[pos], kid: kids[pos], state: states[pos], pos };
 }
 
-async function onKeySuccess(env, kid, state) {
+/**
+ * 记录某个 Key 在一次请求中的成功调用。
+ * @param {any} env
+ * @param {string} kid key 的 hash
+ * @param {any} state 当前 key 状态对象
+ * @param {string|null} modelShort 当前请求使用的模型 short name（如 "gemini-2.5-pro"）
+ */
+async function onKeySuccess(env, kid, state, modelShort = null) {
     state.total_calls = (state.total_calls || 0) + 1;
     state.daily_calls = (state.daily_calls || 0) + 1;
     state.last_used   = Date.now();
+    if (modelShort) {
+        if (!state.model_stats || typeof state.model_stats !== 'object') state.model_stats = {};
+        const ms = state.model_stats[modelShort] || { total_calls: 0, total_errors: 0 };
+        ms.total_calls = (ms.total_calls || 0) + 1;
+        ms.total_errors = ms.total_errors || 0;
+        state.model_stats[modelShort] = ms;
+    }
     await saveKeyState(env, kid, state);
 }
 
-async function onKeyError(env, kid, state, statusCode) {
+/**
+ * 记录某个 Key 在一次请求中的错误。
+ * @param {any} env
+ * @param {string} kid key 的 hash
+ * @param {any} state 当前 key 状态对象
+ * @param {number} statusCode HTTP 状态码
+ * @param {string|null} modelShort 当前请求使用的模型 short name（如 "gemini-2.5-pro"）
+ */
+async function onKeyError(env, kid, state, statusCode, modelShort = null) {
     state.total_errors  = (state.total_errors  || 0) + 1;
     state.daily_errors  = (state.daily_errors  || 0) + 1;
     state.last_error    = Date.now();
     state.last_error_code = statusCode;
-    if (statusCode === 429) state.exhausted_until = Date.now() + DAY_MS;
+    if (modelShort) {
+        if (!state.model_stats || typeof state.model_stats !== 'object') state.model_stats = {};
+        const ms = state.model_stats[modelShort] || { total_calls: 0, total_errors: 0 };
+        ms.total_errors = (ms.total_errors || 0) + 1;
+        ms.total_calls = ms.total_calls || 0;
+        state.model_stats[modelShort] = ms;
+    }
+    if (statusCode === 429) {
+        const until = Date.now() + DAY_MS;
+        // 若有模型信息，则只标记该模型已耗尽；否则退回到旧的“整 Key 封禁”逻辑
+        if (modelShort) {
+            if (!state.exhausted_by_model || typeof state.exhausted_by_model !== 'object') {
+                state.exhausted_by_model = {};
+            }
+            state.exhausted_by_model[modelShort] = until;
+        } else {
+            state.exhausted_until = until;
+        }
+    }
     await saveKeyState(env, kid, state);
 }
 
@@ -238,45 +320,41 @@ async function createToken(env, label, rateLimitSec) {
     const thash = await tokenHash(token);
     const sec   = rateLimitSec === 0 ? 0 : (Math.max(0, Math.min(3600, parseInt(rateLimitSec, 10) || 10)));
     const data  = { label: label || 'Token', created_at: Date.now(), last_used: null, calls: 0, rate_limit_sec: sec, token_preview: maskTokenForPreview(token) };
-    await kvSet(env, 'tok:' + thash, data);
+    await kvSet(env, KV_PREFIX_TOKEN + thash, data);
     return { token, thash, ...data };
 }
 
 async function listTokens(env) {
-    const keys   = await kvList(env, 'tok:');
-    const tokens = [];
-    for (const k of keys) {
-        const data = await kvGet(env, k.name);
-        if (data) tokens.push({ thash: k.name.replace('tok:', ''), ...data });
+    const keys = await kvList(env, KV_PREFIX_TOKEN);
+    if (!keys.length) return [];
+    const results = await Promise.all(keys.map(k => kvGet(env, k.name)));
+    const tokens  = [];
+    for (let i = 0; i < keys.length; i++) {
+        const data = results[i];
+        if (data) tokens.push({ thash: keys[i].name.replace(KV_PREFIX_TOKEN, ''), ...data });
     }
     return tokens.sort((a, b) => b.created_at - a.created_at);
 }
 
 async function revokeToken(env, thash) {
-    await kvDelete(env, 'tok:' + thash);
+    await kvDelete(env, KV_PREFIX_TOKEN + thash);
 }
 
 /** @returns {{ ok: boolean, message?: string, statusCode?: number }} */
 async function validateToken(env, token) {
     if (!token) return { ok: false, message: 'Unauthorized: provide a valid Bearer token', statusCode: 401 };
     const thash = await tokenHash(token);
-    const data  = await kvGet(env, 'tok:' + thash);
+    const data  = await kvGet(env, KV_PREFIX_TOKEN + thash);
     if (!data) return { ok: false, message: 'Unauthorized: provide a valid Bearer token', statusCode: 401 };
 
     // 速率限制：用独立 TTL Key 作为"已使用"标记，避免 read-modify-write 竞态
     // 两个并发请求仍可能同时通过（KV 无原子操作），但窗口极小且不影响安全性
     const intervalSec = data.rate_limit_sec !== undefined ? data.rate_limit_sec : 10;
     if (intervalSec > 0) {
-        const lockKey = 'rl:' + thash;
+        const lockKey = KV_PREFIX_RATE_LIMIT + thash;
         const locked  = await kvGet(env, lockKey);
         if (locked) {
-            // 读取 TTL 剩余时间供提示（KV getWithMetadata 返回 expirationTtl）
-            let waitSec = intervalSec;
-            try {
-                const { metadata } = await env.GEMINI_KV.getWithMetadata(lockKey);
-                if (metadata && typeof metadata.ttl === 'number') waitSec = metadata.ttl;
-            } catch (_) {}
-            return { ok: false, message: `访问过于频繁，请 ${waitSec} 秒后再试`, statusCode: 429 };
+            return { ok: false, message: `访问过于频繁，请 ${intervalSec} 秒后再试`, statusCode: 429 };
         }
         // 写入锁，TTL = intervalSec；并发时后写覆盖先写，效果等同延续锁
         await kvSet(env, lockKey, 1, intervalSec);
@@ -294,8 +372,6 @@ async function validateToken(env, token) {
 // SUPPORTED MODELS (from GET /v1beta/models, refreshed every 6h)
 // ─────────────────────────────────────────────────────────────────────────────
 
-const CFG_SUPPORTED_MODELS_RAW  = 'cfg:supported_models_raw';
-const CFG_SUPPORTED_MODELS_AT  = 'cfg:supported_models_fetched_at';
 const SUPPORTED_MODELS_TTL_SEC = 6 * 3600; // 6 小时
 
 /** 归一化：models/gemini-pro-latest → gemini-pro-latest */
@@ -310,16 +386,16 @@ function toShortModelName(name) {
 // ─────────────────────────────────────────────────────────────────────────────
 
 async function getSupportedModelsRaw(env) {
-    const raw = await kvGet(env, CFG_SUPPORTED_MODELS_RAW);
+    const raw = await kvGet(env, KV_KEY_SUPPORTED_MODELS);
     return Array.isArray(raw) ? raw : [];
 }
 async function getSupportedModelsFetchedAt(env) {
-    const v = await kvGet(env, CFG_SUPPORTED_MODELS_AT);
+    const v = await kvGet(env, KV_KEY_SUPPORTED_FETCHED_AT);
     return typeof v === 'number' && !isNaN(v) ? v : 0;
 }
 async function setSupportedModelsRaw(env, names, fetchedAt) {
-    await kvSet(env, CFG_SUPPORTED_MODELS_RAW, names);
-    await kvSet(env, CFG_SUPPORTED_MODELS_AT, fetchedAt);
+    await kvSet(env, KV_KEY_SUPPORTED_MODELS, names);
+    await kvSet(env, KV_KEY_SUPPORTED_FETCHED_AT, fetchedAt);
 }
 /**
  * 若列表为空或距上次刷新超过 6 小时，用任一 API Key 拉取 /v1beta/models 并更新 KV。
@@ -340,13 +416,17 @@ async function maybeRefreshSupportedModels(env) {
         if (raw.length) { _modelsCache.names = raw; _modelsCache.fetchedAt = fetchedAt; }
         return;
     }
-    const key = keys[0];
-    const url = GEMINI_BASE + '/v1beta/models?key=' + encodeURIComponent(key);
-    let resp;
-    try { resp = await fetch(url); } catch (_) { return; }
-    if (!resp.ok) return;
+    // 轮询所有 Key，避免 keys[0] 已耗尽时无法刷新模型列表（Fix #4）
     let data;
-    try { data = await resp.json(); } catch (_) { return; }
+    let fetchOk = false;
+    for (const key of keys) {
+        const url = GEMINI_BASE + '/v1beta/models?key=' + encodeURIComponent(key);
+        let resp;
+        try { resp = await fetch(url); } catch (_) { continue; }
+        if (!resp.ok) continue;
+        try { data = await resp.json(); fetchOk = true; break; } catch (_) { continue; }
+    }
+    if (!fetchOk || !data) return;
     const names = Array.isArray(data.models) ? data.models.map(m => (m && m.name) || '').filter(Boolean) : [];
     await setSupportedModelsRaw(env, names, now);
     // 回填进程内缓存
@@ -358,38 +438,39 @@ async function maybeRefreshSupportedModels(env) {
     if (filtered.length !== fallback.length) await setFallbackModels(env, filtered);
 }
 
-const CFG_FALLBACK_KEY = 'cfg:fallback_models';
 async function getFallbackModels(env) {
-    const raw = await kvGet(env, CFG_FALLBACK_KEY);
+    const raw = await kvGet(env, KV_KEY_FALLBACK_MODELS);
     if (Array.isArray(raw)) return raw.filter(m => typeof m === 'string' && m.trim());
     return [];
 }
 async function setFallbackModels(env, models) {
     const list = Array.isArray(models) ? models.filter(m => typeof m === 'string' && m.trim()) : [];
-    await kvSet(env, CFG_FALLBACK_KEY, list);
+    await kvSet(env, KV_KEY_FALLBACK_MODELS, list);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // REQUEST LOG (last 50 entries in KV)
 // ─────────────────────────────────────────────────────────────────────────────
 
-const LOG_KV_KEY = 'log:entries';
 const LOG_MAX = 50;
 
-async function appendLog(env, entry) {
+async function appendLogs(env, entries) {
     if (!env.GEMINI_KV) return;
+    if (!Array.isArray(entries) || !entries.length) return;
     try {
-        const raw = await env.GEMINI_KV.get(LOG_KV_KEY, 'json');
+        const raw = await env.GEMINI_KV.get(KV_KEY_LOG_ENTRIES, 'json');
         const list = Array.isArray(raw) ? raw : [];
-        list.unshift(entry);
-        await env.GEMINI_KV.put(LOG_KV_KEY, JSON.stringify(list.slice(0, LOG_MAX)));
+        for (const entry of entries) {
+            list.unshift(entry);
+        }
+        await env.GEMINI_KV.put(KV_KEY_LOG_ENTRIES, JSON.stringify(list.slice(0, LOG_MAX)));
     } catch (_) {}
 }
 
 async function getLogs(env) {
     if (!env.GEMINI_KV) return [];
     try {
-        const raw = await env.GEMINI_KV.get(LOG_KV_KEY, 'json');
+        const raw = await env.GEMINI_KV.get(KV_KEY_LOG_ENTRIES, 'json');
         return Array.isArray(raw) ? raw : [];
     } catch (_) { return []; }
 }
@@ -413,7 +494,7 @@ async function createSession(env) {
     const arr = new Uint8Array(32);
     crypto.getRandomValues(arr);
     const sessionId = Array.from(arr, b => b.toString(16).padStart(2, '0')).join('');
-    await kvSet(env, 'sess:' + sessionId, { created_at: Date.now() }, 86400);
+    await kvSet(env, KV_PREFIX_SESSION + sessionId, { created_at: Date.now() }, 86400);
     return sessionId;
 }
 
@@ -421,7 +502,7 @@ async function createSession(env) {
 async function destroySession(env, req) {
     const cookie = req.headers.get('Cookie') || '';
     const m = cookie.match(new RegExp(COOKIE_NAME + '=([^;]+)'));
-    if (m) await kvDelete(env, 'sess:' + m[1]);
+    if (m) await kvDelete(env, KV_PREFIX_SESSION + m[1]);
 }
 
 /** 验证 session cookie 是否存在于 KV */
@@ -429,7 +510,7 @@ async function isAuthenticated(req, env) {
     const cookie = req.headers.get('Cookie') || '';
     const m = cookie.match(new RegExp(COOKIE_NAME + '=([^;]+)'));
     if (!m) return false;
-    const session = await kvGet(env, 'sess:' + m[1]);
+    const session = await kvGet(env, KV_PREFIX_SESSION + m[1]);
     return !!session;
 }
 
@@ -442,47 +523,73 @@ async function isAuthenticated(req, env) {
   * targetPath: the Gemini path to forward to (e.g. "/v1beta/openai/chat/completions")
   * When all keys return 429, if fallback models are configured, retries once with first fallback model.
   */
-async function proxyToGemini(req, env, targetPath, maxRetries = 3) {
+async function proxyToGemini(req, env, targetPath, maxRetries = 3, ctx) {
     const originalUrl = new URL(req.url);
     const keys        = await getApiKeys(env);
     if (!keys.length) {
         return jsonError('No API keys configured. Add keys in the panel (/) first.', 503);
     }
-    const tries       = Math.min(keys.length, maxRetries);
+    const tries     = Math.min(keys.length, maxRetries);
+    const logBuffer = [];
 
     // 重试前缓存 body：ReadableStream 只能消费一次，否则 429 重试时 POST 体为空
     let bodyBuffer = (req.method !== 'GET' && req.method !== 'HEAD')
         ? await req.arrayBuffer()
         : undefined;
+
+    // Fix #10：拆分为两个语义独立的标志
+    //   modelReplaced — 预处理阶段：请求模型不在支持列表中，已预先替换为备用模型
+    //   fallbackTried — 运行时阶段：所有 Key 都 429 后，已尝试切换备用模型重试
+    let modelReplaced = false;
     let fallbackTried = false;
 
     await maybeRefreshSupportedModels(env);
+    let originalModel = null;
+    let modelShort    = null; // 归一化后的模型名（如 gemini-2.5-pro）
+
+    // Fix #3：bodyBuffer 只解析一次，缓存为 parsedBody 供后续日志复用，避免循环内重复 decode + parse
+    let parsedBody = null;
     if (bodyBuffer) {
-        try {
-            const body = JSON.parse(new TextDecoder().decode(bodyBuffer));
-            if (body && typeof body.model === 'string') {
-                const supportedRaw = await getSupportedModelsRaw(env);
-                if (supportedRaw.length > 0) {
-                    const shortSet = new Set(supportedRaw.map(toShortModelName));
-                    if (!shortSet.has(toShortModelName(body.model))) {
-                        const fallbackModels = await getFallbackModels(env);
-                        if (fallbackModels[0]) {
-                            body.model = toShortModelName(fallbackModels[0]);
-                        }
-                    }
-                }
-                // 统一为 models/xxx 再转发，避免同一模型因格式不同被 Google 计入不同配额导致 429
-                if (body.model && !body.model.startsWith('models/')) {
-                    body.model = 'models/' + body.model;
-                }
-                bodyBuffer = new TextEncoder().encode(JSON.stringify(body)).buffer;
-            }
-        } catch (_) {}
+        try { parsedBody = JSON.parse(new TextDecoder().decode(bodyBuffer)); } catch (_) {}
     }
+
+    if (parsedBody && typeof parsedBody.model === 'string') {
+        // 记录用户最初请求的模型，供日志展示，避免因回退/归一化导致"看起来像用了别的模型"
+        originalModel = parsedBody.model;
+        const supportedRaw = await getSupportedModelsRaw(env);
+        if (supportedRaw.length > 0) {
+            const shortSet = new Set(supportedRaw.map(toShortModelName));
+            if (!shortSet.has(toShortModelName(parsedBody.model))) {
+                const fallbackModels = await getFallbackModels(env);
+                if (fallbackModels[0]) {
+                    parsedBody.model = fallbackModels[0];
+                    modelReplaced = true; // 预处理阶段已替换，运行时无需再 fallback
+                }
+            }
+        }
+        // 统一为 models/xxx 再转发，避免同一模型因格式不同被 Google 计入不同配额导致 429
+        if (parsedBody.model && !parsedBody.model.startsWith('models/')) {
+            parsedBody.model = 'models/' + parsedBody.model;
+        }
+        modelShort = toShortModelName(parsedBody.model);
+        bodyBuffer = new TextEncoder().encode(JSON.stringify(parsedBody)).buffer;
+    }
+
+    // 对于 Gemini 原生接口，如果 body 中没有显式 model 字段，则从路径中提取
+    if (!modelShort && targetPath.startsWith('/v1beta/models/')) {
+        const after     = targetPath.slice('/v1beta/models/'.length);
+        const modelPart = after.split(':', 1)[0];
+        if (modelPart) modelShort = toShortModelName(modelPart);
+    }
+
+    // 预先准备日志用的 input 摘要（Fix #3：不在循环内重复解析）
+    const logInput = parsedBody
+        ? (typeof parsedBody === 'object' ? JSON.stringify(parsedBody) : String(parsedBody)).slice(0, 500)
+        : null;
 
     while (true) {
         for (let attempt = 0; attempt < tries; attempt++) {
-            const { key, kid, state } = await pickKey(env);
+            const { key, kid, state } = await pickKey(env, modelShort);
 
             const url = new URL(GEMINI_BASE + targetPath);
             originalUrl.searchParams.forEach((v, k) => { if (k !== 'key') url.searchParams.set(k, v); });
@@ -513,54 +620,60 @@ async function proxyToGemini(req, env, targetPath, maxRetries = 3) {
             });
 
             if (resp.status === 429) {
-                await onKeyError(env, kid, state, 429);
+                // 记录本次 429 错误到 Key 状态与日志，然后尝试下一个 Key
+                if (ctx) ctx.waitUntil(onKeyError(env, kid, state, 429, modelShort));
+                else await onKeyError(env, kid, state, 429, modelShort);
+                logBuffer.push({ ts: Date.now(), path: targetPath, method: req.method,
+                    model: originalModel || modelShort || null, status: 429,
+                    input: logInput, redirect: url.toString() });
                 continue;
             }
 
             if (!resp.ok) {
-                await onKeyError(env, kid, state, resp.status);
+                if (ctx) ctx.waitUntil(onKeyError(env, kid, state, resp.status, modelShort));
+                else await onKeyError(env, kid, state, resp.status, modelShort);
             } else {
-                await onKeySuccess(env, kid, state);
+                if (ctx) ctx.waitUntil(onKeySuccess(env, kid, state, modelShort));
+                else await onKeySuccess(env, kid, state, modelShort);
             }
 
-            const logEntry = { ts: Date.now(), path: targetPath, method: req.method, model: null, status: resp.status, input: null, output: null };
-            try {
-                if (bodyBuffer) {
-                    const b = JSON.parse(new TextDecoder().decode(bodyBuffer));
-                    logEntry.model = b.model || null;
-                    logEntry.input = (typeof b === 'object' ? JSON.stringify(b) : String(b)).slice(0, 500);
-                }
-            } catch (_) {}
-            if (!resp.ok) {
-                try { logEntry.output = (await resp.clone().text()).slice(0, 500); } catch (_) {}
-            }
-            await appendLog(env, logEntry);
+            // 日志优先展示"用户请求的原始模型"，而非代理内部回退/归一化后的模型
+            logBuffer.push({ ts: Date.now(), path: targetPath, method: req.method,
+                model: originalModel || (parsedBody && parsedBody.model) || null,
+                status: resp.status, input: logInput, redirect: url.toString() });
 
             const outHeaders = new Headers(resp.headers);
             outHeaders.set('Access-Control-Allow-Origin',  '*');
             outHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
             outHeaders.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+            if (logBuffer.length) {
+                const logsToWrite = logBuffer.splice(0, logBuffer.length);
+                if (ctx) ctx.waitUntil(appendLogs(env, logsToWrite));
+                else await appendLogs(env, logsToWrite);
+            }
             return new Response(resp.body, { status: resp.status, headers: outHeaders });
         }
 
-        // All keys returned 429 — try once with first fallback model if configured
-        if (fallbackTried || !bodyBuffer) break;
+        // 所有 Key 均返回 429 — 若配置了备用模型且尚未尝试，切换后重试一次（Fix #10）
+        if (modelReplaced || fallbackTried || !bodyBuffer || !parsedBody) break;
         const fallbackModels = await getFallbackModels(env);
         if (!fallbackModels.length) break;
-        try {
-            const dec = new TextDecoder().decode(bodyBuffer);
-            const body = JSON.parse(dec);
-            if (body && typeof body.model === 'string') {
-                const fallbackName = fallbackModels[0];
-                body.model = fallbackName.startsWith('models/') ? fallbackName : 'models/' + fallbackName;
-                bodyBuffer = new TextEncoder().encode(JSON.stringify(body)).buffer;
-                fallbackTried = true;
-                continue;
-            }
-        } catch (_) {}
+        if (typeof parsedBody.model === 'string') {
+            const fallbackName = fallbackModels[0];
+            parsedBody.model = fallbackName.startsWith('models/') ? fallbackName : 'models/' + fallbackName;
+            modelShort = toShortModelName(parsedBody.model);
+            bodyBuffer = new TextEncoder().encode(JSON.stringify(parsedBody)).buffer;
+            fallbackTried = true;
+            continue;
+        }
         break;
     }
 
+    if (logBuffer.length) {
+        const logsToWrite = logBuffer.splice(0, logBuffer.length);
+        if (ctx) ctx.waitUntil(appendLogs(env, logsToWrite));
+        else await appendLogs(env, logsToWrite);
+    }
     return jsonError('All API keys are exhausted (429). Please try again later.', 429);
 }
 
@@ -636,9 +749,33 @@ async function handlePanelStats(req, env) {
     const keys = await getApiKeys(env);
     const now  = Date.now();
     const stats = [];
+    // 并发预取所有 Key 的 hash 与状态（Fix #5）
+    const kids   = await Promise.all(keys.map(k => keyHash(k)));
+    const states = await Promise.all(kids.map(kid => getKeyState(env, kid)));
     for (let i = 0; i < keys.length; i++) {
-        const kid   = await keyHash(keys[i]);
-        const state = await getKeyState(env, kid);
+        const kid   = kids[i];
+        const state = states[i];
+        const exByModel = state.exhausted_by_model || {};
+        const modelStats = state.model_stats && typeof state.model_stats === 'object' ? state.model_stats : {};
+        const models = [];
+        let exhaustedFlag = false;
+        let exhaustedUntil = state.exhausted_until && typeof state.exhausted_until === 'number' ? state.exhausted_until : null;
+        for (const m of Object.keys(modelStats)) {
+            const ms = modelStats[m] || {};
+            const ts = typeof exByModel[m] === 'number' ? exByModel[m] : null;
+            const isExhausted = !!(ts && ts > now);
+            if (isExhausted) {
+                exhaustedFlag = true;
+                if (!exhaustedUntil || ts > exhaustedUntil) exhaustedUntil = ts;
+            }
+            models.push({
+                model:         m,
+                total_calls:   ms.total_calls || 0,
+                total_errors:  ms.total_errors || 0,
+                exhausted:     isExhausted,
+                exhausted_until: ts,
+            });
+        }
         stats.push({
             index: i, kid,
             masked:          maskKey(keys[i]),
@@ -649,9 +786,10 @@ async function handlePanelStats(req, env) {
             last_used:       state.last_used,
             last_error:      state.last_error,
             last_error_code: state.last_error_code,
-            exhausted:       !!(state.exhausted_until && state.exhausted_until > now),
-            exhausted_until: state.exhausted_until,
+            exhausted:       exhaustedFlag,
+            exhausted_until: exhaustedUntil,
             last_reset:      state.last_reset,
+            models,
         });
     }
     return jsonResp({ ok: true, total: keys.length, keys: stats });
@@ -663,8 +801,9 @@ async function handlePanelReset(req, env) {
     const kid = new URL(req.url).searchParams.get('kid');
     if (kid === 'all') {
         const keys = await getApiKeys(env);
-        for (const k of keys) await resetKeyState(env, await keyHash(k));
-        await kvSet(env, 'rr_idx', 0);
+        // 并发 reset 所有 Key（Fix #9）
+        await Promise.all(keys.map(async k => resetKeyState(env, await keyHash(k))));
+        await kvSet(env, KV_KEY_ROUND_ROBIN_INDEX, 0);
         return jsonResp({ ok: true, message: 'All keys reset' });
     }
     if (!kid) return jsonError('Missing kid parameter', 400);
@@ -748,10 +887,10 @@ async function handleApiKeysPut(req, env) {
     if (index < 0 || index >= keys.length) return jsonError('无效的 index', 400);
     // 清理旧 Key 的孤儿状态
     const oldKid = await keyHash(keys[index]);
-    await kvDelete(env, 'ks:' + oldKid);
+    await kvDelete(env, KV_PREFIX_KEYSTATE + oldKid);
     keys[index] = key;
     await setApiKeys(env, keys);
-    await kvSet(env, 'rr_idx', 0);
+    await kvSet(env, KV_KEY_ROUND_ROBIN_INDEX, 0);
     return jsonResp({ ok: true, keys: keys.map((k, i) => ({ index: i, masked: maskKey(k) })) });
 }
 
@@ -764,10 +903,10 @@ async function handleApiKeysDelete(req, env) {
     if (index >= keys.length) return jsonError('无效的 index', 400);
     // 清理被删除 Key 的孤儿状态
     const oldKid = await keyHash(keys[index]);
-    await kvDelete(env, 'ks:' + oldKid);
+    await kvDelete(env, KV_PREFIX_KEYSTATE + oldKid);
     keys.splice(index, 1);
     await setApiKeys(env, keys);
-    await kvSet(env, 'rr_idx', 0);
+    await kvSet(env, KV_KEY_ROUND_ROBIN_INDEX, 0);
     return jsonResp({ ok: true, keys: keys.map((k, i) => ({ index: i, masked: maskKey(k) })) });
 }
 
@@ -812,7 +951,7 @@ async function handlePanelLogsClear(req, env) {
     if (!await isAuthenticated(req, env)) return jsonResp({ error: 'Unauthorized' }, 401);
     const kvErr = requireKV(env); if (kvErr) return kvErr;
     try {
-        await env.GEMINI_KV.put(LOG_KV_KEY, JSON.stringify([]));
+        await env.GEMINI_KV.put(KV_KEY_LOG_ENTRIES, JSON.stringify([]));
         return jsonResp({ ok: true });
     } catch (e) {
         return jsonError('清空日志失败', 500);
@@ -1086,9 +1225,9 @@ table:has(#log-tbody) th:nth-child(4){white-space:nowrap}
                     <thead><tr>
                         <th>#</th><th>密钥</th><th>状态</th>
                         <th>总调用</th><th>今日</th><th>错误</th>
-                        <th>最后使用</th><th>操作</th>
+                        <th>模型明细</th><th>最后使用</th><th>操作</th>
                     </tr></thead>
-                    <tbody id="keys-tbody"><tr class="empty-row"><td colspan="8">加载中…</td></tr></tbody>
+                    <tbody id="keys-tbody"><tr class="empty-row"><td colspan="9">加载中…</td></tr></tbody>
                 </table>
             </div>
         </div>
@@ -1222,7 +1361,7 @@ gemini "你好！"</pre>
                 </div>
                 <div style="padding:18px;max-height:70vh;overflow:auto">
                     <table>
-                        <thead><tr><th>时间</th><th>路径</th><th>模型</th><th>状态</th><th>输入</th><th>输出</th></tr></thead>
+                        <thead><tr><th>时间</th><th>路径</th><th>模型</th><th>状态</th><th>输入</th><th>重定向</th></tr></thead>
                         <tbody id="log-tbody"><tr class="empty-row"><td colspan="6">加载中…</td></tr></tbody>
                     </table>
                 </div>
@@ -1348,7 +1487,7 @@ function renderKeys(d){
     document.getElementById('s-today').textContent=td.toLocaleString();
 
     var tb=document.getElementById('keys-tbody');
-    if(!keys.length){tb.innerHTML='<tr class="empty-row"><td colspan="8">请在上方添加 API 密钥</td></tr>';return;}
+    if(!keys.length){tb.innerHTML='<tr class="empty-row"><td colspan="9">请在上方添加 API 密钥</td></tr>';return;}
     tb.innerHTML=keys.map(function(k){
         var badge, extra='';
         if(k.exhausted){
@@ -1360,6 +1499,15 @@ function renderKeys(d){
             badge='<span class="badge bg-idle"><span class="bdot"></span>空闲</span>';
         }
         var ec=k.total_errors>0?'num nr':'num nd';
+        var mstats='';
+        if(k.models && k.models.length){
+            mstats=k.models.map(function(m){
+                var flag=m.exhausted?'⚠ ':'';
+                return flag+escapeHtml(m.model)+': '+(m.total_calls||0)+' / '+(m.total_errors||0);
+            }).join('<br/>');
+        }else{
+            mstats='—';
+        }
         return '<tr>'
             +'<td class="nd num">'+(k.index+1)+'</td>'
             +'<td class="mono">'+k.masked+'</td>'
@@ -1367,8 +1515,9 @@ function renderKeys(d){
             +'<td><span class="nb num">'+k.total_calls.toLocaleString()+'</span></td>'
             +'<td><span class="num">'+k.daily_calls.toLocaleString()+'</span></td>'
             +'<td><span class="'+ec+'">'+k.total_errors.toLocaleString()+'</span></td>'
+            +'<td class="ts">'+mstats+'</td>'
             +'<td><span class="ts">'+timeAgo(k.last_used)+'</span></td>'
-            +'<td><button class="btn btn-out btn-xs" data-kid="'+escHtml(k.kid)+'" onclick="resetKey(this.dataset.kid)">重置</button></td>'
+            +'<td><button class="btn btn-out btn-xs" data-kid="'+escapeHtml(k.kid)+'" onclick="resetKey(this.dataset.kid)">重置</button></td>'
             +'</tr>';
     }).join('');
 }
@@ -1412,7 +1561,7 @@ function renderApiKeys(){
         return;
     }
     tb.innerHTML=_apiKeys.map(function(k){
-        return '<tr><td class="mono">'+escHtml(k.masked)+'</td><td><button class="btn btn-out btn-xs" data-i="'+k.index+'" onclick="editApiKey(this.dataset.i)">编辑</button> <button class="btn btn-rd btn-xs" data-i="'+k.index+'" onclick="deleteApiKey(this.dataset.i)" style="margin-left:12px">删除</button></td></tr>';
+        return '<tr><td class="mono">'+escapeHtml(k.masked)+'</td><td><button class="btn btn-out btn-xs" data-i="'+k.index+'" onclick="editApiKey(this.dataset.i)">编辑</button> <button class="btn btn-rd btn-xs" data-i="'+k.index+'" onclick="deleteApiKey(this.dataset.i)" style="margin-left:12px">删除</button></td></tr>';
     }).join('');
 }
 
@@ -1482,7 +1631,7 @@ function renderFallbackModels(){
     tb.innerHTML=_fallbackModels.map(function(m,i){
         var upBtn = i > 0 ? '<button class="btn btn-out btn-xs" data-i="'+i+'" onclick="moveFallbackModelUp(this.dataset.i)" title="上移">↑</button> ' : '';
         var downBtn = i < _fallbackModels.length - 1 ? '<button class="btn btn-out btn-xs" data-i="'+i+'" onclick="moveFallbackModelDown(this.dataset.i)" title="下移">↓</button> ' : '';
-        return '<tr><td class="monohi">'+escHtml(m)+'</td><td>'+upBtn+downBtn+'<button class="btn btn-rd btn-xs" data-i="'+i+'" onclick="removeFallbackModel(this.dataset.i)" style="margin-left:8px">删除</button></td></tr>';
+        return '<tr><td class="monohi">'+escapeHtml(m)+'</td><td>'+upBtn+downBtn+'<button class="btn btn-rd btn-xs" data-i="'+i+'" onclick="removeFallbackModel(this.dataset.i)" style="margin-left:8px">删除</button></td></tr>';
     }).join('');
 }
 
@@ -1581,10 +1730,10 @@ function renderLogs(logs) {
         var ts = e.ts ? new Date(e.ts).toLocaleString() : '—';
         var statusCls = e.status >= 400 ? 'nr' : 'ng';
         var istr = e.input != null && String(e.input) !== '' ? String(e.input) : '';
-        var ostr = e.output != null && String(e.output) !== '' ? String(e.output) : '';
-        var inputD = istr ? escHtml(istr.slice(0, 120)) + (istr.length > 120 ? '…' : '') : '—';
-        var outputD = ostr ? escHtml(ostr.slice(0, 120)) + (ostr.length > 120 ? '…' : '') : '—';
-        return '<tr><td class="ts">' + ts + '</td><td class="mono">' + escHtml(e.path || '—') + '</td><td class="monohi">' + escHtml(e.model || '—') + '</td><td class="num ' + statusCls + '">' + (e.status || '—') + '</td><td class="mono" style="max-width:200px;overflow:hidden;text-overflow:ellipsis" title="' + escHtml(istr) + '">' + inputD + '</td><td class="mono" style="max-width:200px;overflow:hidden;text-overflow:ellipsis" title="' + escHtml(ostr) + '">' + outputD + '</td></tr>';
+        var ostr = e.redirect != null && String(e.redirect) !== '' ? String(e.redirect) : '';
+        var inputD = istr ? escapeHtml(istr.slice(0, 120)) + (istr.length > 120 ? '…' : '') : '—';
+        var outputD = ostr ? escapeHtml(ostr.slice(0, 120)) + (ostr.length > 120 ? '…' : '') : '—';
+        return '<tr><td class="ts">' + ts + '</td><td class="mono">' + escapeHtml(e.path || '—') + '</td><td class="monohi">' + escapeHtml(e.model || '—') + '</td><td class="num ' + statusCls + '">' + (e.status || '—') + '</td><td class="mono" style="max-width:200px;overflow:hidden;text-overflow:ellipsis" title="' + escapeHtml(istr) + '">' + inputD + '</td><td class="mono" style="max-width:200px;overflow:hidden;text-overflow:ellipsis" title="' + escapeHtml(ostr) + '">' + outputD + '</td></tr>';
     }).join('');
 }
 
@@ -1592,7 +1741,16 @@ async function loadTokens() {
     try {
         var r = await fetch('/panel/tokens', { credentials: 'include' });
         if (r.status === 401) { doLogout(); return; }
+        // 先检查 r.ok：非 200 响应（如 KV 未绑定时的 503）body 是 error JSON，
+        // d.tokens 会是 undefined，导致令牌列表静默显示为空
+        if (!r.ok) {
+            var errD = null;
+            try { errD = await r.json(); } catch (_) {}
+            toast((errD && errD.error) ? errD.error : ('加载令牌列表失败 (HTTP ' + r.status + ')'), 'err');
+            return;
+        }
         var d = await r.json();
+        if (!d.ok) { toast(d.error || '加载令牌列表失败', 'err'); return; }
         renderTokens(d.tokens || []);
     } catch (e) { toast('加载令牌列表失败', 'err'); }
 }
@@ -1601,6 +1759,8 @@ function renderTokens(tokens){
     var cnt=document.getElementById('tok-count');
     if(cnt) cnt.textContent=tokens.length+' token'+(tokens.length!==1?'s':'');
     var tb=document.getElementById('tokens-tbody');
+    // 防御性 null 守卫：若元素不存在则直接返回，避免抛 TypeError 触发 loadTokens 的 catch
+    if(!tb) return;
     if(!tokens.length){
         tb.innerHTML='<tr class="empty-row"><td colspan="7">尚无令牌，请在上方创建以限制 API 访问</td></tr>';
         return;
@@ -1608,13 +1768,13 @@ function renderTokens(tokens){
     tb.innerHTML=tokens.map(function(t){
         var rateStr = (t.rate_limit_sec === 0 || t.rate_limit_sec == null) ? '不限制' : ('每 '+t.rate_limit_sec+' 秒');
         return '<tr>'
-            +'<td><span class="monohi">'+escHtml(t.label||'—')+'</span></td>'
-            +'<td class="mono">'+escHtml(t.token_preview)+'</td>'
+            +'<td><span class="monohi">'+escapeHtml(t.label||'—')+'</span></td>'
+            +'<td class="mono">'+escapeHtml(t.token_preview)+'</td>'
             +'<td class="ts">'+formatDate(t.created_at)+'</td>'
             +'<td class="ts">'+timeAgo(t.last_used)+'</td>'
-            +'<td class="ts">'+escHtml(rateStr)+'</td>'
+            +'<td class="ts">'+escapeHtml(rateStr)+'</td>'
             +'<td class="nb num">'+(t.calls||0)+'</td>'
-            +'<td><button class="btn btn-rd btn-xs" data-thash="'+escHtml(t.thash)+'" onclick="revokeToken(this.dataset.thash)">吊销</button></td>'
+            +'<td><button class="btn btn-rd btn-xs" data-thash="'+escapeHtml(t.thash)+'" onclick="revokeToken(this.dataset.thash)">吊销</button></td>'
             +'</tr>';
     }).join('');
 }
@@ -1660,7 +1820,7 @@ function closeNewToken(){
     document.getElementById('new-token-box').classList.remove('show');
 }
 
-function escHtml(s){
+function escapeHtml(s){
     return String(s).replace(/[&<>"']/g,function(c){
         return{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c];
     });
@@ -1701,9 +1861,9 @@ document.getElementById('tok-label') && document.getElementById('tok-label').add
 // ─────────────────────────────────────────────────────────────────────────────
 
 export default {
-    async fetch(request, env) {
+    async fetch(request, env, ctx) {
         try {
-            return await handleRequest(request, env);
+            return await handleRequest(request, env, ctx);
         } catch (err) {
             const msg = (err && err.message) ? String(err.message) : String(err);
             return new Response(
@@ -1721,76 +1881,76 @@ function escapeHtml(s) {
     return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
 }
 
-async function handleRequest(request, env) {
-        const url    = new URL(request.url);
-        const path   = url.pathname;
-        const method = request.method;
+async function handleRequest(request, env, ctx) {
+    const url    = new URL(request.url);
+    const path   = url.pathname;
+    const method = request.method;
 
-        // ── CORS Preflight ────────────────────────────────────────────────────────
-        if (method === 'OPTIONS') {
-            return new Response(null, {
-                status: 204,
-                headers: {
-                    'Access-Control-Allow-Origin':  '*',
-                    'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
-                    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-                    'Access-Control-Max-Age':       '86400',
-                },
-            });
-        }
-
-        // ── Panel / 默认即登录页 ───────────────────────────────────────────────────
-        if (path === '/' || path === '' || path === '/panel' || path === '/panel/') {
-            return new Response(PANEL_HTML, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
-        }
-        if (path === '/panel/health'        && method === 'GET')  return handlePanelHealth(request, env);
-        if (path === '/panel/login'         && method === 'POST') return handlePanelLogin(request, env);
-        if (path === '/panel/logout'        && method === 'POST') return handlePanelLogout(request, env);
-        if (path === '/panel/stats'         && method === 'GET')  return handlePanelStats(request, env);
-        if (path === '/panel/reset'         && method === 'POST') return handlePanelReset(request, env);
-        if (path === '/panel/api-keys'      && method === 'GET')  return handleApiKeysGet(request, env);
-        if (path === '/panel/api-keys'      && method === 'POST') return handleApiKeysPost(request, env);
-        if (path === '/panel/api-keys'      && method === 'PUT')  return handleApiKeysPut(request, env);
-        if (path === '/panel/api-keys'      && method === 'DELETE') return handleApiKeysDelete(request, env);
-        if (path === '/panel/tokens'        && method === 'GET')  return handleTokenList(request, env);
-        if (path === '/panel/tokens/create' && method === 'POST') return handleTokenCreate(request, env);
-        if (path === '/panel/tokens/revoke' && method === 'POST') return handleTokenRevoke(request, env);
-        if (path === '/panel/fallback-models' && method === 'GET') return handleFallbackModelsGet(request, env);
-        if (path === '/panel/fallback-models' && method === 'PUT') return handleFallbackModelsPut(request, env);
-        if (path === '/panel/logs' && method === 'GET') return handlePanelLogs(request, env);
-        if (path === '/panel/logs' && method === 'DELETE') return handlePanelLogsClear(request, env);
-
-        // ── API Auth Check ────────────────────────────────────────────────────────
-        const authResult = await checkApiAuth(request, env);
-        if (!authResult.ok) {
-            return jsonError(authResult.message || 'Unauthorized: provide a valid Bearer token', authResult.statusCode || 401);
-        }
-
-        // ── OpenAI-compatible endpoint (official Gemini OpenAI compat layer) ──────
-        // Ref: https://ai.google.dev/gemini-api/docs/openai
-        // Official base: https://generativelanguage.googleapis.com/v1beta/openai/
-        if (path.startsWith('/v1/')) {
-            // Map /v1/xxx → /v1beta/openai/xxx
-            const geminiPath = '/v1beta/openai' + path.slice(3);   // /v1/chat/completions → /v1beta/openai/chat/completions
-            return proxyToGemini(request, env, geminiPath);
-        }
-
-        // ── Gemini native endpoint (direct passthrough) ───────────────────────────
-        if (path.startsWith('/v1beta/')) {
-            return proxyToGemini(request, env, path);
-        }
-
-        // ── Root info ─────────────────────────────────────────────────────────────
-        return jsonResp({
-            name:    'Gemini Key Rotation Proxy',
-            version: '2.0.0',
-            docs:    'https://ai.google.dev/gemini-api/docs/openai',
-            endpoints: {
-                panel:              'GET  /panel',
-                openai_chat:        'POST /v1/chat/completions',
-                openai_models:      'GET  /v1/models',
-                openai_embeddings:  'POST /v1/embeddings',
-                gemini_native:      'POST /v1beta/models/{model}:generateContent',
+    // ── CORS Preflight ────────────────────────────────────────────────────────
+    if (method === 'OPTIONS') {
+        return new Response(null, {
+            status: 204,
+            headers: {
+                'Access-Control-Allow-Origin':  '*',
+                'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+                'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+                'Access-Control-Max-Age':       '86400',
             },
         });
+    }
+
+    // ── Panel / 默认即登录页 ───────────────────────────────────────────────────
+    if (path === '/' || path === '' || path === '/panel' || path === '/panel/') {
+        return new Response(PANEL_HTML, { headers: { 'Content-Type': 'text/html; charset=utf-8' } });
+    }
+    if (path === '/panel/health'        && method === 'GET')  return handlePanelHealth(request, env);
+    if (path === '/panel/login'         && method === 'POST') return handlePanelLogin(request, env);
+    if (path === '/panel/logout'        && method === 'POST') return handlePanelLogout(request, env);
+    if (path === '/panel/stats'         && method === 'GET')  return handlePanelStats(request, env);
+    if (path === '/panel/reset'         && method === 'POST') return handlePanelReset(request, env);
+    if (path === '/panel/api-keys'      && method === 'GET')  return handleApiKeysGet(request, env);
+    if (path === '/panel/api-keys'      && method === 'POST') return handleApiKeysPost(request, env);
+    if (path === '/panel/api-keys'      && method === 'PUT')  return handleApiKeysPut(request, env);
+    if (path === '/panel/api-keys'      && method === 'DELETE') return handleApiKeysDelete(request, env);
+    if (path === '/panel/tokens'        && method === 'GET')  return handleTokenList(request, env);
+    if (path === '/panel/tokens/create' && method === 'POST') return handleTokenCreate(request, env);
+    if (path === '/panel/tokens/revoke' && method === 'POST') return handleTokenRevoke(request, env);
+    if (path === '/panel/fallback-models' && method === 'GET') return handleFallbackModelsGet(request, env);
+    if (path === '/panel/fallback-models' && method === 'PUT') return handleFallbackModelsPut(request, env);
+    if (path === '/panel/logs' && method === 'GET') return handlePanelLogs(request, env);
+    if (path === '/panel/logs' && method === 'DELETE') return handlePanelLogsClear(request, env);
+
+    // ── API Auth Check ────────────────────────────────────────────────────────
+    const authResult = await checkApiAuth(request, env);
+    if (!authResult.ok) {
+        return jsonError(authResult.message || 'Unauthorized: provide a valid Bearer token', authResult.statusCode || 401);
+    }
+
+    // ── OpenAI-compatible endpoint (official Gemini OpenAI compat layer) ──────
+    // Ref: https://ai.google.dev/gemini-api/docs/openai
+    // Official base: https://generativelanguage.googleapis.com/v1beta/openai/
+    if (path.startsWith('/v1/')) {
+        // Map /v1/xxx → /v1beta/openai/xxx
+        const geminiPath = '/v1beta/openai' + path.slice(3);   // /v1/chat/completions → /v1beta/openai/chat/completions
+        return proxyToGemini(request, env, geminiPath, 3, ctx);
+    }
+
+    // ── Gemini native endpoint (direct passthrough) ───────────────────────────
+    if (path.startsWith('/v1beta/')) {
+        return proxyToGemini(request, env, path, 3, ctx);
+    }
+
+    // ── Root info ─────────────────────────────────────────────────────────────
+    return jsonResp({
+        name:    'Gemini Key Rotation Proxy',
+        version: '2.0.0',
+        docs:    'https://ai.google.dev/gemini-api/docs/openai',
+        endpoints: {
+            panel:              'GET  /panel',
+            openai_chat:        'POST /v1/chat/completions',
+            openai_models:      'GET  /v1/models',
+            openai_embeddings:  'POST /v1/embeddings',
+            gemini_native:      'POST /v1beta/models/{model}:generateContent',
+        },
+    });
 }
