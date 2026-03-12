@@ -133,14 +133,6 @@ function maskKey(key) {
     return key.slice(0, 6) + '••••••••' + key.slice(-4);
 }
 
-function maskKeyForLog(key) {
-    if (!key || key.length < 12) return '****';
-    const head = key.slice(0, 6);
-    const tail = key.slice(-6);
-    const stars = '*'.repeat(Math.max(4, key.length - 12));
-    return head + stars + tail;
-}
-
 // ─────────────────────────────────────────────────────────────────────────────
 // KEY STATE
 // ─────────────────────────────────────────────────────────────────────────────
@@ -670,9 +662,9 @@ async function proxyToGemini(req, env, targetPath, maxRetries = 3, ctx) {
                 // 记录本次 429 错误到 Key 状态与日志，然后尝试下一个 Key
                 if (ctx) ctx.waitUntil(onKeyError(env, kid, state, 429, modelShort));
                 else await onKeyError(env, kid, state, 429, modelShort);
-                logBuffer.push({ ts: Date.now(), path: targetPath, method: req.method,
-                    model: originalModel || modelShort || null, status: 429,
-                    input: logInput, redirect: url.toString(), api_key: maskKeyForLog(key) });
+            logBuffer.push({ ts: Date.now(), path: targetPath, method: req.method,
+                model: originalModel || modelShort || null, status: 429,
+                input: logInput, redirect: url.toString(), api_key: maskKey(key) });
                 continue;
             }
 
@@ -687,7 +679,7 @@ async function proxyToGemini(req, env, targetPath, maxRetries = 3, ctx) {
             // 日志优先展示"用户请求的原始模型"，而非代理内部回退/归一化后的模型
             logBuffer.push({ ts: Date.now(), path: targetPath, method: req.method,
                 model: originalModel || (parsedBody && parsedBody.model) || null,
-                status: resp.status, input: logInput, redirect: url.toString(), api_key: maskKeyForLog(key) });
+                status: resp.status, input: logInput, redirect: url.toString(), api_key: maskKey(key) });
 
             const outHeaders = new Headers(resp.headers);
             outHeaders.set('Access-Control-Allow-Origin',  '*');
@@ -1236,7 +1228,7 @@ table:has(#log-tbody) th:nth-child(4){white-space:nowrap}
         <div class="sg" id="stats-grid">
             <div class="sc cb"><div class="slbl">密钥总数</div><div class="snum bl" id="s-total">—</div></div>
             <div class="sc cg"><div class="slbl">活跃密钥</div><div class="snum gn" id="s-active">—</div></div>
-            <div class="sc cr"><div class="slbl">已耗尽</div><div class="snum rd" id="s-exhaust">—</div></div>
+            <div class="sc cr"><div class="slbl">受限密钥</div><div class="snum rd" id="s-exhaust">—</div></div>
             <div class="sc cy"><div class="slbl">今日调用</div><div class="snum yl" id="s-today">—</div></div>
         </div>
 
@@ -1538,7 +1530,7 @@ function renderKeys(d){
     tb.innerHTML=keys.map(function(k){
         var badge, extra='';
         if(k.exhausted){
-            badge='<span class="badge bg-exhaust"><span class="bdot"></span>已耗尽</span>';
+            badge='<span class="badge bg-exhaust"><span class="bdot"></span>受限</span>';
             if(k.exhausted_until) extra='<span class="cdwn">'+countdown(k.exhausted_until)+'</span>';
         }else if(k.last_used){
             badge='<span class="badge bg-active"><span class="bdot"></span>活跃</span>';
@@ -1549,8 +1541,9 @@ function renderKeys(d){
         var mstats='';
         if(k.models && k.models.length){
             mstats=k.models.map(function(m){
-                var flag=m.exhausted?'⚠ ':'';
-                return '<div style="margin-bottom:0.125rem">'+flag+escapeHtml(m.model)+': '+(m.total_calls||0)+' / '+(m.total_errors||0)+'</div>';
+                var hasErr=(m.total_errors||0)>0;
+                var cls=hasErr?'nr':'nd';
+                return '<div class="'+cls+'" style="margin-bottom:0.125rem">'+escapeHtml(m.model)+': '+(m.total_calls||0)+' / '+(m.total_errors||0)+'</div>';
             }).join('');
         }else{
             mstats='—';
@@ -1783,11 +1776,11 @@ function renderLogs(logs) {
         var keyD = kstr ? escapeHtml(kstr) : '—';
         return '<tr>'
             + '<td class="ts">' + ts + '</td>'
-            + '<td class="mono" style="max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + escapeHtml(e.path || '—') + '">' + escapeHtml(e.path || '—') + '</td>'
+            + '<td class="mono" style="word-break:break-all" title="' + escapeHtml(e.path || '—') + '">' + escapeHtml(e.path || '—') + '</td>'
             + '<td class="monohi">' + escapeHtml(e.model || '—') + '</td>'
             + '<td class="num ' + statusCls + '">' + (e.status || '—') + '</td>'
             + '<td class="mono" style="max-width:200px;overflow:hidden;text-overflow:ellipsis" title="' + escapeHtml(istr) + '">' + inputD + '</td>'
-            + '<td class="mono" style="max-width:200px;overflow:hidden;text-overflow:ellipsis" title="' + escapeHtml(kstr) + '">' + keyD + '</td>'
+            + '<td class="mono" title="' + escapeHtml(kstr) + '">' + keyD + '</td>'
             + '</tr>';
     }).join('');
 }
