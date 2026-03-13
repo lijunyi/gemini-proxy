@@ -1013,7 +1013,7 @@ async function handlePanelLogout(req, env) {
 }
 
 async function handlePanelStats(req, env) {
-    if (!await isAuthenticated(req, env)) return jsonResp({ error: 'Unauthorized' }, 401);
+    if (!await isAuthenticated(req, env)) return jsonResp({ ok: false, error: 'Unauthorized' }, 200);
     const kvErr = requireKV(env); if (kvErr) return kvErr;
     const keys = await getApiKeys(env);
     const now  = Date.now();
@@ -1313,7 +1313,7 @@ body{font-family:var(--sans);background:var(--bg);color:var(--tx);min-height:100
 
 /* Login */
 #login{display:flex;align-items:center;justify-content:center;min-height:100vh}
-.lw{width:380px}
+.lw{width:380px;transform:translateY(-180px)}
 .lhead{text-align:center;margin-bottom:40px}
 .licon{font-size:48px;margin-bottom:14px;display:block;
     filter:drop-shadow(0 0 16px rgba(14,165,233,.25))}
@@ -1759,16 +1759,23 @@ gemini "你好！"</pre>
 </div>
 
 <script>
-var _tab = 'keys';
+var _tab = (function(){
+    try { return localStorage.getItem('gproxy_tab') || 'keys'; } catch (e) { return 'keys'; }
+})();
 
-function switchTab(t) {
-    _tab = t;
+function setActiveTab(t){
     document.querySelectorAll('.navtab').forEach(function (el) { el.classList.remove('active'); });
     document.querySelectorAll('.tabpanel').forEach(function (el) { el.classList.remove('active'); });
     var tabEl = document.getElementById('tab-' + t);
     var panelEl = document.getElementById('tp-' + t);
     if (tabEl) tabEl.classList.add('active');
     if (panelEl) panelEl.classList.add('active');
+}
+
+function switchTab(t) {
+    _tab = t;
+    try { localStorage.setItem('gproxy_tab', t); } catch (e) {}
+    setActiveTab(t);
     if (t === 'keys') loadApiKeys();
     if (t === 'tokens') loadTokens();
     if (t === 'filter') { loadTokenFilters(); loadSupportedModels(); }
@@ -1839,6 +1846,7 @@ window.doLogout = async function() {
 function showDash() {
     document.getElementById('login').style.display = 'none';
     document.getElementById('dash').style.display = 'block';
+    setActiveTab(_tab);
     loadHealth();
     loadAll();
 }
@@ -1868,8 +1876,8 @@ function loadAll() {
 async function loadStats(){
     try{
         var r=await fetch('/panel/stats',{credentials:'include'});
-        if(r.status===401){doLogout();return;}
         var d=await r.json();
+        if (d && d.ok === false && d.error === 'Unauthorized') { doLogout(); return; }
         renderKeys(d);
     }catch(e){toast('加载统计失败','err');}
 }
