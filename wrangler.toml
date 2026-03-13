@@ -6,4 +6,4 @@ keep_vars = true
 # 控制台：Worker → 设置 → 绑定 → 添加 KV 命名空间 → 变量名填 GEMINI_KV，命名空间选自定义的即可
 # [[kv_namespaces]]
 # binding = "GEMINI_KV"
-# id = ""
+# id = "local"
