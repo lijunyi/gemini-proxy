@@ -225,6 +225,8 @@ const DEFAULT_STATE = () => ({
     exhausted_by_model: {},         // 模型级别的耗尽截止时间（short name → ts）
     model_stats:     {},            // 每个模型的累计调用与错误统计（short name → { total_calls, total_errors }）
     model_stats_order: [],          // 最近使用的模型顺序（short name），用于裁剪体积
+    connectivity_ok: true,          // 连通性状态：true=正常，false=连通性测试失败
+    last_connectivity_check: null,  // 最后一次连通性检查时间
     last_reset:      Date.now(),
 });
 
@@ -303,6 +305,9 @@ async function pickKey(env, modelShort = null, keys = null, preloaded = null) {
     for (let i = 0; i < list.length; i++) {
         const pos   = (idx + i) % list.length;
         const state = states[pos];
+
+        // 跳过连通性测试失败的密钥
+        if (state.connectivity_ok === false) continue;
 
         // 优先按模型维度判断是否已耗尽；若未提供模型名，则使用 Key 级别的 exhausted_until
         if (modelShort && state.exhausted_by_model && typeof state.exhausted_by_model === 'object') {
@@ -1149,7 +1154,7 @@ async function handleApiKeysPost(req, env) {
         return jsonError('API Key 格式不正确（应以 AIza 开头，共 39 个字符）', 400);
     }
     const keys = await getApiKeys(env);
-    if (keys.includes(key)) return jsonResp({ ok: false, error: '该 API Key 已存在' }, 400);
+    if (keys.includes(key)) return jsonError('该 API Key 已存在', 400);
     keys.push(key);
     await setApiKeys(env, keys);
     return jsonResp({ ok: true, keys: keys.map((k, i) => ({ index: i, masked: maskKey(k) })) });
@@ -1198,6 +1203,7 @@ async function handleApiKeysVerify(req, env) {
     if (!await isAuthenticated(req, env)) return jsonResp({ error: 'Unauthorized' }, 401);
     const kvErr = requireKV(env); if (kvErr) return kvErr;
     const keys = await getApiKeys(env);
+    const now = Date.now();
     const results = await Promise.all(keys.map(async key => {
         let ok = false;
         let status = null;
@@ -1213,6 +1219,11 @@ async function handleApiKeysVerify(req, env) {
         } finally {
             clearTimeout(timer);
         }
+        const kid = await keyHash(key);
+        const state = await getKeyState(env, kid);
+        state.connectivity_ok = ok;
+        state.last_connectivity_check = now;
+        await saveKeyState(env, kid, state);
         return { masked: maskKey(key), ok, status };
     }));
     const passed = results.filter(r => r.ok).length;
@@ -1312,14 +1323,14 @@ body{font-family:var(--sans);background:var(--bg);color:var(--tx);min-height:100
         radial-gradient(ellipse 60% 40% at 90% 110%,rgba(5,150,105,.06) 0%,transparent 55%)}
 
 /* Login */
-#login{display:flex;align-items:center;justify-content:center;min-height:100vh}
-.lw{width:380px;transform:translateY(-180px)}
+#login{display:flex;align-items:center;justify-content:center;min-height:100vh;animation:fadeIn .6s ease-out}
+.lw{width:380px;transform:translateY(-180px);animation:float 6s ease-in-out infinite}
 .lhead{text-align:center;margin-bottom:40px}
 .licon{font-size:48px;margin-bottom:14px;display:block;
-    filter:drop-shadow(0 0 16px rgba(14,165,233,.25))}
-.ltit{font-size:22px;font-weight:700;color:var(--txh);letter-spacing:.04em}
-.lsub{font-size:13px;color:var(--tx2);margin-top:6px;letter-spacing:.04em;text-transform:uppercase}
-.card{background:var(--s1);border:1px solid var(--b1);border-radius:12px;padding:32px;box-shadow:0 1px 3px rgba(0,0,0,.06)}
+    filter:drop-shadow(0 0 16px rgba(14,165,233,.25));animation:pulse 3s infinite}
+.ltit{font-size:22px;font-weight:700;color:var(--txh);letter-spacing:.04em;animation:slideInLeft .6s ease-out}
+.lsub{font-size:13px;color:var(--tx2);margin-top:6px;letter-spacing:.04em;text-transform:uppercase;animation:slideInRight .6s ease-out}
+.card{background:var(--s1);border:1px solid var(--b1);border-radius:12px;padding:32px;box-shadow:0 1px 3px rgba(0,0,0,.06);animation:fadeIn .8s ease-out}
 label{display:block;font-size:13px;font-weight:600;letter-spacing:.04em;text-transform:uppercase;color:var(--tx2);margin-bottom:8px}
 input[type=password],input[type=text]{width:100%;background:var(--s2);border:1px solid var(--b1);border-radius:7px;
     padding:11px 14px;color:var(--txh);font-family:var(--mono);font-size:13px;outline:none;
@@ -1361,13 +1372,48 @@ input:focus{border-color:var(--bl);box-shadow:0 0 0 3px rgba(14,165,233,.15)}
 .htag-g{color:var(--gn);border-color:rgba(5,150,105,.35);background:rgba(5,150,105,.06)}
 .hright{display:flex;align-items:center;gap:8px}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.2}}
+@keyframes fadeIn{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}
+@keyframes slideInLeft{from{opacity:0;transform:translateX(-20px)}to{opacity:1;transform:translateX(0)}}
+@keyframes slideInRight{from{opacity:0;transform:translateX(20px)}to{opacity:1;transform:translateX(0)}}
+@keyframes pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.05)}}
+@keyframes shimmer{0%{background-position:-200% 0}100%{background-position:200% 0}}
+@keyframes bounce{0%,20%,50%,80%,100%{transform:translateY(0)}40%{transform:translateY(-10px)}60%{transform:translateY(-5px)}}
+@keyframes rotate{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-5px)}}
+@keyframes shake{0%,100%{transform:translateX(0)}10%,30%,50%,70%,90%{transform:translateX(-5px)}20%,40%,60%,80%{transform:translateX(5px)}}
+
+/* 动画类 */
+.animate-fadeIn{animation:fadeIn .4s ease-out}
+.animate-slideInLeft{animation:slideInLeft .4s ease-out}
+.animate-slideInRight{animation:slideInRight .4s ease-out}
+.animate-pulse{animation:pulse 2s infinite}
+.animate-bounce{animation:bounce 1s}
+.animate-float{animation:float 3s ease-in-out infinite}
+.animate-shake{animation:shake .5s}
+
+/* 悬停动画 */
+.card:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,.08)}
+.sc:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,.08)}
+.pbox:hover{box-shadow:0 2px 8px rgba(0,0,0,.06)}
+.navtab:hover{animation:pulse .6s}
+
+/* 加载动画 */
+.loading{display:inline-flex;align-items:center;gap:8px}
+.loading::before{content:'';width:16px;height:16px;border:2px solid var(--b2);border-top-color:var(--bl);border-radius:50%;animation:rotate .8s linear infinite}
+
+/* 渐变背景动画 */
+.shimmer{background:linear-gradient(90deg,var(--s2) 25%,var(--s1) 50%,var(--s2) 75%);background-size:200% 100%;animation:shimmer 1.5s infinite}
+
+/* 按钮点击动画 */
+.btn:active{animation:bounce .3s}
 
 /* Nav tabs */
 .navtabs{display:flex;gap:2px;padding:16px 0 0;border-bottom:1px solid var(--b1);background:var(--s1)}
 .navtab{padding:9px 18px;font-size:15px;font-weight:600;cursor:pointer;border-radius:7px 7px 0 0;
-    color:var(--tx2);border:1px solid transparent;border-bottom:none;transition:all .15s;
+    color:var(--tx2);border:1px solid transparent;border-bottom:none;transition:all .25s cubic-bezier(.34,1.56,.64,1);
     position:relative;bottom:-1px}
-.navtab.active{background:var(--s2);color:var(--txh);border-color:var(--b1);border-bottom:2px solid var(--bl)}
+.navtab:hover{transform:translateY(-2px)}
+.navtab.active{background:var(--s2);color:var(--txh);border-color:var(--b1);border-bottom:2px solid var(--bl);animation:pulse .6s}
 .navtab:not(.active):hover{color:var(--tx);background:var(--s2)}
 
 /* Content */
@@ -1376,19 +1422,26 @@ input:focus{border-color:var(--bl);box-shadow:0 0 0 3px rgba(14,165,233,.15)}
 /* Stat grid */
 .sg{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:24px}
 .sc{background:var(--s1);border:1px solid var(--b1);border-radius:10px;padding:18px;
-    position:relative;overflow:hidden;box-shadow:0 1px 2px rgba(0,0,0,.04)}
-.sc::before{content:'';position:absolute;top:0;left:0;right:0;height:2px}
-.sc.cb::before{background:linear-gradient(90deg,var(--bl),var(--bl2))}
-.sc.cg::before{background:linear-gradient(90deg,var(--gn),var(--gn2))}
-.sc.cr::before{background:linear-gradient(90deg,var(--rd),var(--rd2))}
-.sc.cy::before{background:linear-gradient(90deg,var(--yl),var(--yl2))}
+    position:relative;overflow:hidden;box-shadow:0 1px 2px rgba(0,0,0,.04);
+    animation:fadeIn .5s ease-out;transition:all .3s ease}
+.sc:nth-child(1){animation-delay:.1s}
+.sc:nth-child(2){animation-delay:.2s}
+.sc:nth-child(3){animation-delay:.3s}
+.sc:nth-child(4){animation-delay:.4s}
+.sc::before{content:'';position:absolute;top:0;left:0;right:0;height:2px;animation:shimmer 2s infinite}
+.sc.cb::before{background:linear-gradient(90deg,var(--bl),var(--bl2),var(--bl))}
+.sc.cg::before{background:linear-gradient(90deg,var(--gn),var(--gn2),var(--gn))}
+.sc.cr::before{background:linear-gradient(90deg,var(--rd),var(--rd2),var(--rd))}
+.sc.cy::before{background:linear-gradient(90deg,var(--yl),var(--yl2),var(--yl))}
 .slbl{font-size:14px;font-weight:700;letter-spacing:.06em;text-transform:uppercase;color:var(--tx2);margin-bottom:10px}
-.snum{font-family:var(--mono);font-size:28px;font-weight:600;line-height:1}
+.snum{font-family:var(--mono);font-size:28px;font-weight:600;line-height:1;transition:all .3s ease}
+.sc:hover .snum{transform:scale(1.05)}
 .snum.bl{color:var(--bl)}.snum.gn{color:var(--gn)}
 .snum.rd{color:var(--rd)}.snum.yl{color:var(--yl)}
 
 /* Panel box */
-.pbox{background:var(--s1);border:1px solid var(--b1);border-radius:10px;overflow:hidden;margin-bottom:20px;box-shadow:0 1px 2px rgba(0,0,0,.04)}
+.pbox{background:var(--s1);border:1px solid var(--b1);border-radius:10px;overflow:hidden;margin-bottom:20px;
+    box-shadow:0 1px 2px rgba(0,0,0,.04);animation:fadeIn .6s ease-out;transition:all .3s ease}
 .phead{display:flex;align-items:center;justify-content:space-between;
     padding:14px 18px;border-bottom:1px solid var(--b1);background:var(--s2)}
 .ptit{font-size:16px;font-weight:600;color:var(--txh)}
@@ -1398,19 +1451,24 @@ input:focus{border-color:var(--bl);box-shadow:0 0 0 3px rgba(14,165,233,.15)}
 table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums; font-feature-settings:"tnum";}
 th{font-size:13px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;
     color:var(--tx2);text-align:left;padding:9px 16px;border-bottom:1px solid var(--b1);
-    background:var(--s2)}
-td{padding:12px 16px;font-size:15px;border-bottom:1px solid var(--b1);vertical-align:middle;line-height:1.35}
+    background:var(--s2);transition:all .2s ease}
+td{padding:12px 16px;font-size:15px;border-bottom:1px solid var(--b1);
+    vertical-align:middle;line-height:1.35;transition:all .2s ease}
 tr:last-child td{border-bottom:none}
 tr:hover td{background:var(--s2)}
+tr{transition:all .2s ease}
+tr:hover{transform:translateX(2px)}
 .mono{font-family:var(--mono);font-size:14px;color:var(--tx2);letter-spacing:.02em;line-height:1.35}
 .monohi{font-family:var(--mono);font-size:14px;color:var(--txh);line-height:1.35}
-.model-line{margin-bottom:6px;line-height:1.6}
+.model-line{margin-bottom:6px;line-height:1.6;transition:all .2s ease}
+.model-line:hover{transform:translateX(4px)}
 .model-line:last-child{margin-bottom:0}
 .num{font-family:var(--mono);font-size:15px;line-height:1.35}
 .nb{color:var(--bl)}.ng{color:var(--gn)}.nr{color:var(--rd)}.nd{color:var(--tx2)}
 .ts{font-size:13px;color:var(--tx2);font-family:var(--mono)}
 .badge{display:inline-flex;align-items:center;gap:4px;font-size:12px;font-weight:600;
-    padding:3px 8px;border-radius:4px;letter-spacing:.04em}
+    padding:3px 8px;border-radius:4px;letter-spacing:.04em;transition:all .2s ease}
+.badge:hover{transform:scale(1.05)}
 .bg-active{background:rgba(5,150,105,.1);color:var(--gn);border:1px solid rgba(5,150,105,.25)}
 .bg-exhaust{background:rgba(220,38,38,.08);color:var(--rd);border:1px solid rgba(220,38,38,.25)}
 .bg-idle{background:var(--s2);color:var(--tx2);border:1px solid var(--b1)}
@@ -1423,11 +1481,12 @@ table:has(#log-tbody) th:nth-child(4){white-space:nowrap}
 /* Token section */
 .newtoken{background:rgba(0,232,154,.06);border:1px solid rgba(0,232,154,.2);
     border-radius:8px;padding:14px 18px;margin-bottom:14px;display:none}
-.newtoken.show{display:block}
+.newtoken.show{display:block;animation:fadeIn .4s ease-out}
 .tokval{font-family:var(--mono);font-size:12px;color:var(--gn);word-break:break-all;
     background:var(--s2);border:1px solid rgba(5,150,105,.3);border-radius:6px;
-    padding:10px 12px;margin:10px 0;cursor:pointer;transition:background .15s}
-.tokval:hover{background:rgba(5,150,105,.08)}
+    padding:10px 12px;margin:10px 0;cursor:pointer;transition:all .2s ease}
+.tokval:hover{background:rgba(5,150,105,.08);transform:scale(1.02)}
+.tokval:active{animation:bounce .3s}
 .tokwarn{font-size:12px;color:var(--yl);display:flex;align-items:center;gap:5px}
 
 /* Toast：显示在 hdr 上方、居中，稍大 */
@@ -1980,7 +2039,10 @@ async function addApiKey(){
         var r=await fetch('/panel/api-keys',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({key:v})});
         var d=await r.json();
         if(d.ok){inp.value='';_apiKeys=d.keys||[];renderApiKeys();loadStats();toast('已添加 ✓');}
-        else{toast(d.error||'添加失败','err');}
+        else{
+            var errMsg = d.error ? (d.error.message || d.error) : '添加失败';
+            toast(errMsg,'err');
+        }
     }catch(e){toast('添加失败','err');}
 }
 
@@ -1995,7 +2057,10 @@ async function editApiKey(i){
         var r=await fetch('/panel/api-keys',{method:'PUT',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({index:i,key:newKey})});
         var d=await r.json();
         if(d.ok){_apiKeys=d.keys||[];renderApiKeys();loadStats();toast('已更新 ✓');}
-        else{toast(d.error||'更新失败','err');}
+        else{
+            var errMsg = d.error ? (d.error.message || d.error) : '更新失败';
+            toast(errMsg,'err');
+        }
     }catch(e){toast('更新失败','err');}
 }
 
@@ -2007,7 +2072,10 @@ async function deleteApiKey(i){
         var r=await fetch('/panel/api-keys?index='+i,{method:'DELETE',credentials:'include'});
         var d=await r.json();
         if(d.ok){_apiKeys=d.keys||[];renderApiKeys();loadStats();toast('已删除');}
-        else{toast(d.error||'删除失败','err');}
+        else{
+            var errMsg = d.error ? (d.error.message || d.error) : '删除失败';
+            toast(errMsg,'err');
+        }
     }catch(e){toast('删除失败','err');}
 }
 
@@ -2020,11 +2088,15 @@ async function verifyApiKeys(){
         var d = await r.json();
         if (!d || !d.ok) { toast('连通性检测失败','err'); return; }
         var lines = (d.results || []).map(function(it){
-            return (it.ok ? '✓ ' : '✗ ') + it.masked + (it.ok ? '' : (' (HTTP ' + (it.status || 'ERR') + ')'));
-        }).join('\\n');
+            if (it.ok) {
+                return '<span style="color: var(--gn)">✓ ' + escapeHtml(it.masked) + '</span>';
+            } else {
+                return '<span style="color: var(--rd)">✗ ' + escapeHtml(it.masked) + ' (HTTP ' + (it.status || 'ERR') + ')</span>';
+            }
+        }).join('<br>');
         var box = document.getElementById('key-verify-box');
         var val = document.getElementById('key-verify-val');
-        if (val) val.textContent = '连通性通过 ' + d.passed + ' / ' + d.total + '\\n' + lines;
+        if (val) val.innerHTML = '连通性通过 ' + d.passed + ' / ' + d.total + '<br>' + lines;
         if (box) box.classList.add('show');
     }catch(e){ toast('连通性检测失败','err'); }
 }
@@ -2172,11 +2244,16 @@ async function loadTokens() {
         if (!r.ok) {
             var errD = null;
             try { errD = await r.json(); } catch (_) {}
-            toast((errD && errD.error) ? errD.error : ('加载令牌列表失败 (HTTP ' + r.status + ')'), 'err');
+            var errMsg = errD && errD.error ? (errD.error.message || errD.error) : ('加载令牌列表失败 (HTTP ' + r.status + ')');
+            toast(errMsg, 'err');
             return;
         }
         var d = await r.json();
-        if (!d.ok) { toast(d.error || '加载令牌列表失败', 'err'); return; }
+        if (!d.ok) { 
+            var errMsg = d.error ? (d.error.message || d.error) : '加载令牌列表失败';
+            toast(errMsg, 'err'); 
+            return; 
+        }
         renderTokens(d.tokens || []);
     } catch (e) { toast('加载令牌列表失败', 'err'); }
 }
@@ -2330,7 +2407,8 @@ async function saveBlockedModels(){
             closeModelFilter();
             loadTokenFilters();
         } else {
-            toast((d && d.error) ? d.error : '更新失败', 'err');
+            var errMsg = d && d.error ? (d.error.message || d.error) : '更新失败';
+            toast(errMsg, 'err');
         }
     }catch(e){ toast('更新失败', 'err'); }
 }
@@ -2350,7 +2428,10 @@ async function createToken(){
             document.getElementById('tok-label').value='';
             toast('令牌已创建，请立即复制','ok');
             loadTokens();
-        }else{toast('创建令牌失败','err');}
+        }else{
+            var errMsg = d.error ? (d.error.message || d.error) : '创建令牌失败';
+            toast(errMsg,'err');
+        }
     }catch(e){toast('创建令牌出错','err');}
 }
 
@@ -2360,6 +2441,10 @@ async function revokeToken(thash){
         var r=await fetch('/panel/tokens/revoke?thash='+encodeURIComponent(thash),{method:'POST',credentials:'include'});
         var d=await r.json();
         if(d.ok){toast('令牌已吊销');loadTokens();}
+        else{
+            var errMsg = d.error ? (d.error.message || d.error) : '吊销失败';
+            toast(errMsg,'err');
+        }
     }catch(e){toast('吊销失败','err');}
 }
 
