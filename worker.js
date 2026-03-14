@@ -864,11 +864,8 @@ async function proxyToGemini(req, env, targetPath, maxRetries = 3, ctx, tokenDat
                 logBuffer.push({ ts: Date.now(), path: targetPath, method: req.method,
                     model: originalModel || modelShort || null, status: 504,
                     input: logInput, redirect: redactKeyFromUrl(url.toString()), api_key: maskKey(key) });
-                if (logBuffer.length) {
-                    const logsToWrite = logBuffer.splice(0, logBuffer.length);
-                    if (ctx) ctx.waitUntil(appendLogs(env, logsToWrite));
-                    else await appendLogs(env, logsToWrite);
-                }
+                await flushLogs(ctx, env, logBuffer);
+
                 return jsonError('Upstream timeout', 504);
             }
             throw e;
@@ -894,14 +891,9 @@ async function proxyToGemini(req, env, targetPath, maxRetries = 3, ctx, tokenDat
                 model: originalModel || modelShort || null, status: resp.status,
                 input: logInput, redirect: redactKeyFromUrl(url.toString()), api_key: maskKey(key) });
             const outHeaders = new Headers(resp.headers);
-            outHeaders.set('Access-Control-Allow-Origin',  '*');
-            outHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-            outHeaders.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-            if (logBuffer.length) {
-                const logsToWrite = logBuffer.splice(0, logBuffer.length);
-                if (ctx) ctx.waitUntil(appendLogs(env, logsToWrite));
-                else await appendLogs(env, logsToWrite);
-            }
+            setCorsHeaders(outHeaders);
+            await flushLogs(ctx, env, logBuffer);
+
             return new Response(resp.body, { status: resp.status, headers: outHeaders });
         }
 
@@ -919,28 +911,23 @@ async function proxyToGemini(req, env, targetPath, maxRetries = 3, ctx, tokenDat
             status: resp.status, input: logInput, redirect: redactKeyFromUrl(url.toString()), api_key: maskKey(key) });
 
         const outHeaders = new Headers(resp.headers);
-        outHeaders.set('Access-Control-Allow-Origin',  '*');
-        outHeaders.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-        outHeaders.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
-        if (logBuffer.length) {
-            const logsToWrite = logBuffer.splice(0, logBuffer.length);
-            if (ctx) ctx.waitUntil(appendLogs(env, logsToWrite));
-            else await appendLogs(env, logsToWrite);
-        }
+        setCorsHeaders(outHeaders);
+        await flushLogs(ctx, env, logBuffer);
+
         return new Response(resp.body, { status: resp.status, headers: outHeaders });
     }
 
-    if (logBuffer.length) {
-        const logsToWrite = logBuffer.splice(0, logBuffer.length);
-        if (ctx) ctx.waitUntil(appendLogs(env, logsToWrite));
-        else await appendLogs(env, logsToWrite);
-    }
+    await flushLogs(ctx, env, logBuffer);
     return jsonError('All API keys are exhausted (429). Please try again later.', 429);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 // SIMPLE HELPERS
 // ─────────────────────────────────────────────────────────────────────────────
+
+function escapeHtml(s) {
+    return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+}
 
 function jsonResp(data, status = 200) {
     return new Response(JSON.stringify(data), {
@@ -960,6 +947,21 @@ function requireKV(env) {
         503
     );
     return null;
+}
+
+/** 将 logBuffer 中的日志条目刷新到 KV（best-effort），并清空 buffer */
+async function flushLogs(ctx, env, logBuffer) {
+    if (!logBuffer.length) return;
+    const logsToWrite = logBuffer.splice(0, logBuffer.length);
+    if (ctx) ctx.waitUntil(appendLogs(env, logsToWrite));
+    else await appendLogs(env, logsToWrite);
+}
+
+/** 为代理响应添加 CORS 头 */
+function setCorsHeaders(headers) {
+    headers.set('Access-Control-Allow-Origin',  '*');
+    headers.set('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    headers.set('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2514,9 +2516,6 @@ export default {
     },
 };
 
-function escapeHtml(s) {
-    return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
-}
 
 async function handleRequest(request, env, ctx) {
     const url    = new URL(request.url);
