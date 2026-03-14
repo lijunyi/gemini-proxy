@@ -58,17 +58,18 @@ const RETRY_MINUTES_MAX           = 1440;
 
 /**
  * 时序安全的字符串比较，防止时序攻击（timing attack）。
- * 使用随机 HMAC Key 对两个字符串分别签名后做逐字节 XOR 比较。
+ * 对两个字符串各做一次 SHA-256，哈希后长度固定（32字节）再做字节 XOR。
+ * 相比原 HMAC 方案，少了 generateKey + sign 两步，性能较好且语义相同安全。
  */
 async function timingSafeEqual(a, b) {
     const enc = new TextEncoder();
-    const key = await crypto.subtle.generateKey({ name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
-    const [sigA, sigB] = await Promise.all([
-        crypto.subtle.sign('HMAC', key, enc.encode(a)),
-        crypto.subtle.sign('HMAC', key, enc.encode(b)),
+    // 哈希后长度固定，原始密码长度信息不泄露
+    const [hashA, hashB] = await Promise.all([
+        crypto.subtle.digest('SHA-256', enc.encode(a)),
+        crypto.subtle.digest('SHA-256', enc.encode(b)),
     ]);
-    const arrA = new Uint8Array(sigA);
-    const arrB = new Uint8Array(sigB);
+    const arrA = new Uint8Array(hashA);
+    const arrB = new Uint8Array(hashB);
     let diff = 0;
     for (let i = 0; i < arrA.length; i++) diff |= arrA[i] ^ arrB[i];
     return diff === 0;
@@ -152,33 +153,24 @@ const _retryMinutesCache = { value: /** @type {number|null} */ (null), fetchedAt
 
 async function kvGet(env, key) {
     if (!env.GEMINI_KV) return null;
-    try { return await env.GEMINI_KV.get(key, 'json'); } catch { return null; }
+    try { return await env.GEMINI_KV.get(key, 'json'); }
+    catch (e) { console.error('[KV] get 失败', key, e?.message); return null; }
 }
 
 async function kvSet(env, key, value, ttl) {
     if (!env.GEMINI_KV) return;
     const opts = ttl ? { expirationTtl: ttl } : undefined;
-    try { await env.GEMINI_KV.put(key, JSON.stringify(value), opts); } catch {}
+    try { await env.GEMINI_KV.put(key, JSON.stringify(value), opts); }
+    catch (e) { console.error('[KV] set 失败', key, e?.message); }
 }
 
 async function kvDelete(env, key) {
     if (!env.GEMINI_KV) return;
-    try { await env.GEMINI_KV.delete(key); } catch {}
+    try { await env.GEMINI_KV.delete(key); }
+    catch (e) { console.error('[KV] delete 失败', key, e?.message); }
 }
 
-async function kvList(env, prefix) {
-    if (!env.GEMINI_KV) return [];
-    try {
-        const all = [];
-        let cursor;
-        do {
-            const result = await env.GEMINI_KV.list({ prefix, cursor, limit: 1000 });
-            all.push(...(result.keys || []));
-            cursor = result.list_complete ? undefined : result.cursor;
-        } while (cursor);
-        return all;
-    } catch { return []; }
-}
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // API KEYS (stored in KV, configured in panel)
@@ -274,7 +266,7 @@ async function resetKeyState(env, kid) {
  * @param {any} env
  * @param {string|null} modelShort 当前请求使用的模型 short name（如 "gemini-2.5-pro"），用于按模型维度跳过已耗尽的 key。
  */
-async function pickKey(env, modelShort = null, keys = null, preloaded = null) {
+async function pickKey(env, modelShort = null, keys = null) {
     const list = Array.isArray(keys) ? keys : await getApiKeys(env);
     if (!list.length) throw new Error('No API keys configured');
     const now = Date.now();
@@ -282,9 +274,9 @@ async function pickKey(env, modelShort = null, keys = null, preloaded = null) {
     let idx = (await kvGet(env, KV_KEY_ROUND_ROBIN_INDEX)) ?? 0;
     if (typeof idx !== 'number' || isNaN(idx)) idx = 0;
 
-    // 并发预取所有 Key 的 hash 与状态，避免串行 KV 读（Fix #5）
-    const kids   = (preloaded && Array.isArray(preloaded.kids)) ? preloaded.kids : await Promise.all(list.map(k => keyHash(k)));
-    const states = (preloaded && Array.isArray(preloaded.states)) ? preloaded.states : await Promise.all(kids.map(kid => getKeyState(env, kid)));
+    // 并发预取所有 Key 的 hash 与状态，避免串行 KV 读
+    const kids   = await Promise.all(list.map(k => keyHash(k)));
+    const states = await Promise.all(kids.map(kid => getKeyState(env, kid)));
 
     // 自动每日重置：并发写入所有需要重置的 Key，不阻塞主流程
     const resetPromises = [];
@@ -329,61 +321,37 @@ async function pickKey(env, modelShort = null, keys = null, preloaded = null) {
     return { key: list[pos], kid: kids[pos], state: states[pos] };
 }
 
-/**
- * 记录某个 Key 在一次请求中的成功调用。
- * @param {any} env
- * @param {string} kid key 的 hash
- * @param {any} state 当前 key 状态对象
- * @param {string|null} modelShort 当前请求使用的模型 short name（如 "gemini-2.5-pro"）
- */
+/** 更新模型级别的调用/错误统计（去重公共逻辑） */
+const MODEL_STATS_MAX = 50;
+function updateModelStats(state, modelShort, field) {
+    if (!modelShort) return;
+    if (!state.model_stats || typeof state.model_stats !== 'object') state.model_stats = {};
+    if (!Array.isArray(state.model_stats_order)) state.model_stats_order = [];
+    const ms = state.model_stats[modelShort] || { total_calls: 0, total_errors: 0 };
+    ms[field] = (ms[field] || 0) + 1;
+    state.model_stats[modelShort] = ms;
+    state.model_stats_order = state.model_stats_order.filter(m => m !== modelShort);
+    state.model_stats_order.push(modelShort);
+    if (state.model_stats_order.length > MODEL_STATS_MAX) {
+        const toRemove = state.model_stats_order.splice(0, state.model_stats_order.length - MODEL_STATS_MAX);
+        for (const m of toRemove) delete state.model_stats[m];
+    }
+}
+
 async function onKeySuccess(env, kid, state, modelShort = null) {
     state.total_calls = (state.total_calls || 0) + 1;
     state.daily_calls = (state.daily_calls || 0) + 1;
     state.last_used   = Date.now();
-    if (modelShort) {
-        if (!state.model_stats || typeof state.model_stats !== 'object') state.model_stats = {};
-        if (!Array.isArray(state.model_stats_order)) state.model_stats_order = [];
-        const ms = state.model_stats[modelShort] || { total_calls: 0, total_errors: 0 };
-        ms.total_calls = (ms.total_calls || 0) + 1;
-        ms.total_errors = ms.total_errors || 0;
-        state.model_stats[modelShort] = ms;
-        state.model_stats_order = state.model_stats_order.filter(m => m !== modelShort);
-        state.model_stats_order.push(modelShort);
-        if (state.model_stats_order.length > 20) {
-            const toRemove = state.model_stats_order.splice(0, state.model_stats_order.length - 20);
-            for (const m of toRemove) delete state.model_stats[m];
-        }
-    }
+    updateModelStats(state, modelShort, 'total_calls');
     await saveKeyState(env, kid, state);
 }
 
-/**
- * 记录某个 Key 在一次请求中的错误。
- * @param {any} env
- * @param {string} kid key 的 hash
- * @param {any} state 当前 key 状态对象
- * @param {number} statusCode HTTP 状态码
- * @param {string|null} modelShort 当前请求使用的模型 short name（如 "gemini-2.5-pro"）
- */
 async function onKeyError(env, kid, state, statusCode, modelShort = null) {
     state.total_errors  = (state.total_errors  || 0) + 1;
     state.daily_errors  = (state.daily_errors  || 0) + 1;
     state.last_error    = Date.now();
     state.last_error_code = statusCode;
-    if (modelShort) {
-        if (!state.model_stats || typeof state.model_stats !== 'object') state.model_stats = {};
-        if (!Array.isArray(state.model_stats_order)) state.model_stats_order = [];
-        const ms = state.model_stats[modelShort] || { total_calls: 0, total_errors: 0 };
-        ms.total_errors = (ms.total_errors || 0) + 1;
-        ms.total_calls = ms.total_calls || 0;
-        state.model_stats[modelShort] = ms;
-        state.model_stats_order = state.model_stats_order.filter(m => m !== modelShort);
-        state.model_stats_order.push(modelShort);
-        if (state.model_stats_order.length > 20) {
-            const toRemove = state.model_stats_order.splice(0, state.model_stats_order.length - 20);
-            for (const m of toRemove) delete state.model_stats[m];
-        }
-    }
+    updateModelStats(state, modelShort, 'total_errors');
     if (statusCode === 429) {
         const retryMin = await getRetryMinutes(env);
         const until = Date.now() + retryMin * 60 * 1000;
@@ -408,16 +376,9 @@ const ALPHANUM = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789
 function generateToken() {
     const arr = new Uint8Array(16);
     crypto.getRandomValues(arr);
-    const limit = 256 - (256 % ALPHANUM.length);
     let suffix = '';
     for (let i = 0; i < arr.length; i++) {
-        let b = arr[i];
-        while (b >= limit) {
-            const tmp = new Uint8Array(1);
-            crypto.getRandomValues(tmp);
-            b = tmp[0];
-        }
-        suffix += ALPHANUM[b % ALPHANUM.length];
+        suffix += ALPHANUM[arr[i] % ALPHANUM.length];
     }
     return 'token-' + suffix;
 }
@@ -488,29 +449,17 @@ async function listTokens(env) {
     const thashes = await getTokenIndex(env);
     const results = thashes.length ? await Promise.all(thashes.map(h => kvGet(env, KV_PREFIX_TOKEN + h))) : [];
     const tokens  = [];
-    let missing = 0;
+    const validHashes = [];
     for (let i = 0; i < thashes.length; i++) {
         const data = results[i];
-        // data 为 null 表示该 token 已被直接删除但索引未清理，跳过即可
-        if (data) tokens.push({ thash: thashes[i], ...data });
-        else missing++;
+        if (data) {
+            tokens.push({ thash: thashes[i], ...data });
+            validHashes.push(thashes[i]);
+        }
     }
-    // 若索引为空或存在缺失，尝试通过 kvList 进行一次修复（最终一致，低频）
-    if (!tokens.length || missing > 0) {
-        const listed = await kvList(env, KV_PREFIX_TOKEN);
-        const listedHashes = listed.map(k => (k && k.name) ? k.name.slice(KV_PREFIX_TOKEN.length) : '').filter(Boolean);
-        const merged = Array.from(new Set([...thashes, ...listedHashes]));
-        if (merged.length && merged.length !== thashes.length) {
-            await kvSet(env, KV_KEY_TOKEN_INDEX, merged);
-        }
-        if (merged.length && (merged.length !== tokens.length)) {
-            const mergedData = await Promise.all(merged.map(h => kvGet(env, KV_PREFIX_TOKEN + h)));
-            tokens.length = 0;
-            for (let i = 0; i < merged.length; i++) {
-                const data = mergedData[i];
-                if (data) tokens.push({ thash: merged[i], ...data });
-            }
-        }
+    // 索引中存在已失效的 thash，自动清理
+    if (validHashes.length !== thashes.length) {
+        await kvSet(env, KV_KEY_TOKEN_INDEX, validHashes);
     }
     return tokens.sort((a, b) => b.created_at - a.created_at);
 }
@@ -564,7 +513,7 @@ async function validateToken(env, token) {
 // SUPPORTED MODELS (from GET /v1beta/models, refreshed every 6h)
 // ─────────────────────────────────────────────────────────────────────────────
 
-const SUPPORTED_MODELS_TTL_SEC = 6 * 3600; // 6 小时
+const SUPPORTED_MODELS_TTL_MS = 6 * 3600 * 1000; // 6 小时
 
 /** 归一化：models/gemini-pro-latest → gemini-pro-latest */
 function toShortModelName(name) {
@@ -619,13 +568,13 @@ function supportedModelSet(models) {
 async function maybeRefreshSupportedModels(env, force = false) {
     const now = Date.now();
     // 进程内缓存命中：直接返回，完全跳过 KV 读
-    if (!force && _modelsCache.models && (now - _modelsCache.fetchedAt) < SUPPORTED_MODELS_TTL_SEC * 1000) return;
+    if (!force && _modelsCache.models && (now - _modelsCache.fetchedAt) < SUPPORTED_MODELS_TTL_MS) return;
 
     const keys = await getApiKeys(env);
     if (!keys.length) return;
     const cached = await getSupportedModelsKV(env);
     const fetchedAt = cached.fetchedAt;
-    if (!force && fetchedAt > 0 && (now - fetchedAt) < SUPPORTED_MODELS_TTL_SEC * 1000) {
+    if (!force && fetchedAt > 0 && (now - fetchedAt) < SUPPORTED_MODELS_TTL_MS) {
         // KV 缓存仍有效，回填进程内缓存
         const raw = normalizeSupportedModels(cached.models);
         if (raw.length) { _modelsCache.models = raw; _modelsCache.fetchedAt = fetchedAt; }
@@ -730,17 +679,19 @@ async function isAuthenticated(req, env) {
 // CORE PROXY  (with key retry on 429)
 // ─────────────────────────────────────────────────────────────────────────────
 
+const MAX_RETRIES = 3;
+
 /**
   * Forward a request to Gemini, injecting a rotated API key.
   * targetPath: the Gemini path to forward to (e.g. "/v1beta/openai/chat/completions")
   */
-async function proxyToGemini(req, env, targetPath, maxRetries = 3, ctx, tokenData) {
+async function proxyToGemini(req, env, targetPath, ctx, tokenData) {
     const originalUrl = new URL(req.url);
     const keys        = await getApiKeys(env);
     if (!keys.length) {
         return jsonError('No API keys configured. Add keys in the panel (/) first.', 503);
     }
-    const tries     = Math.min(keys.length, maxRetries);
+    const tries     = Math.min(keys.length, MAX_RETRIES);
     const logBuffer = [];
 
     // 重试前缓存 body：ReadableStream 只能消费一次，否则 429 重试时 POST 体为空
@@ -776,29 +727,7 @@ async function proxyToGemini(req, env, targetPath, maxRetries = 3, ctx, tokenDat
         if (modelPart) modelShort = toShortModelName(modelPart);
     }
 
-    // 全部 Key 已耗尽时提前返回，避免无效重试
-    let preloadedStates = null;
-    {
-        const now = Date.now();
-        const kids = await Promise.all(keys.map(k => keyHash(k)));
-        const states = await Promise.all(kids.map(kid => getKeyState(env, kid)));
-        preloadedStates = { kids, states };
-        let allExhausted = true;
-        for (let i = 0; i < states.length; i++) {
-            const state = states[i];
-            if (state.last_reset && (now - state.last_reset) >= DAY_MS) { allExhausted = false; break; }
-            let exhausted = false;
-            if (state.exhausted_until && state.exhausted_until > now) exhausted = true;
-            if (modelShort && state.exhausted_by_model && typeof state.exhausted_by_model === 'object') {
-                const ts = state.exhausted_by_model[modelShort];
-                if (typeof ts === 'number' && ts > now) exhausted = true;
-            }
-            if (!exhausted) { allExhausted = false; break; }
-        }
-        if (allExhausted) {
-            return jsonError('All API keys are exhausted (429). Please try again later.', 429);
-        }
-    }
+
 
     // 若支持模型列表存在且请求模型不在列表中，按 Gemini 官方错误格式响应
     const supportedRaw = _modelsCache.models
@@ -823,7 +752,7 @@ async function proxyToGemini(req, env, targetPath, maxRetries = 3, ctx, tokenDat
         : null;
 
     for (let attempt = 0; attempt < tries; attempt++) {
-        const { key, kid, state } = await pickKey(env, modelShort, keys, preloadedStates);
+        const { key, kid, state } = await pickKey(env, modelShort, keys);
 
         const url = new URL(GEMINI_BASE + targetPath);
         originalUrl.searchParams.forEach((v, k) => { if (k !== 'key') url.searchParams.set(k, v); });
@@ -876,7 +805,7 @@ async function proxyToGemini(req, env, targetPath, maxRetries = 3, ctx, tokenDat
         if (resp.status === 429) {
             // 记录本次 429 错误到 Key 状态与日志，然后尝试下一个 Key
             await onKeyError(env, kid, state, 429, modelShort);
-            preloadedStates = null;
+
             logBuffer.push({ ts: Date.now(), path: targetPath, method: req.method,
                 model: originalModel || modelShort || null, status: 429,
                 input: logInput, redirect: redactKeyFromUrl(url.toString()), api_key: maskKey(key) });
@@ -1020,8 +949,6 @@ async function handlePanelLogout(req, env) {
 }
 
 async function handlePanelStats(req, env) {
-    if (!await isAuthenticated(req, env)) return jsonResp({ ok: false, error: 'Unauthorized' }, 200);
-    const kvErr = requireKV(env); if (kvErr) return kvErr;
     const keys = await getApiKeys(env);
     const now  = Date.now();
     const stats = [];
@@ -1073,8 +1000,6 @@ async function handlePanelStats(req, env) {
 }
 
 async function handlePanelReset(req, env) {
-    if (!await isAuthenticated(req, env)) return jsonResp({ error: 'Unauthorized' }, 401);
-    const kvErr = requireKV(env); if (kvErr) return kvErr;
     const kid = new URL(req.url).searchParams.get('kid');
     if (kid === 'all') {
         const keys = await getApiKeys(env);
@@ -1089,8 +1014,6 @@ async function handlePanelReset(req, env) {
 }
 
 async function handleTokenCreate(req, env) {
-    if (!await isAuthenticated(req, env)) return jsonResp({ error: 'Unauthorized' }, 401);
-    const kvErr = requireKV(env); if (kvErr) return kvErr;
     let body = {};
     try { body = await req.json(); } catch {}
     const result = await createToken(env, body.label, body.rate_limit_sec);
@@ -1098,8 +1021,6 @@ async function handleTokenCreate(req, env) {
 }
 
 async function handleTokenList(req, env) {
-    if (!await isAuthenticated(req, env)) return jsonResp({ error: 'Unauthorized' }, 401);
-    const kvErr = requireKV(env); if (kvErr) return kvErr;
     const tokens = await listTokens(env);
     const masked = tokens.map(t => ({
         label:          t.label,
@@ -1115,8 +1036,6 @@ async function handleTokenList(req, env) {
 }
 
 async function handleTokenBlockedModels(req, env) {
-    if (!await isAuthenticated(req, env)) return jsonResp({ error: 'Unauthorized' }, 401);
-    const kvErr = requireKV(env); if (kvErr) return kvErr;
     let body = {};
     try { body = await req.json(); } catch { return jsonError('Invalid JSON', 400); }
     const thash = (body.thash || '').trim();
@@ -1128,8 +1047,6 @@ async function handleTokenBlockedModels(req, env) {
 }
 
 async function handleTokenRevoke(req, env) {
-    if (!await isAuthenticated(req, env)) return jsonResp({ error: 'Unauthorized' }, 401);
-    const kvErr = requireKV(env); if (kvErr) return kvErr;
     const thash = new URL(req.url).searchParams.get('thash');
     if (!thash) return jsonError('Missing thash parameter', 400);
     await revokeToken(env, thash);
@@ -1137,16 +1054,12 @@ async function handleTokenRevoke(req, env) {
 }
 
 async function handleApiKeysGet(req, env) {
-    if (!await isAuthenticated(req, env)) return jsonResp({ error: 'Unauthorized' }, 401);
-    const kvErr = requireKV(env); if (kvErr) return kvErr;
     const keys = await getApiKeys(env);
     const list = keys.map((k, i) => ({ index: i, masked: maskKey(k) }));
     return jsonResp({ ok: true, keys: list });
 }
 
 async function handleApiKeysPost(req, env) {
-    if (!await isAuthenticated(req, env)) return jsonResp({ error: 'Unauthorized' }, 401);
-    const kvErr = requireKV(env); if (kvErr) return kvErr;
     let body = {};
     try { body = await req.json(); } catch { return jsonError('Invalid JSON', 400); }
     const key = (body.key || '').trim();
@@ -1163,8 +1076,6 @@ async function handleApiKeysPost(req, env) {
 }
 
 async function handleApiKeysPut(req, env) {
-    if (!await isAuthenticated(req, env)) return jsonResp({ error: 'Unauthorized' }, 401);
-    const kvErr = requireKV(env); if (kvErr) return kvErr;
     let body = {};
     try { body = await req.json(); } catch { return jsonError('Invalid JSON', 400); }
     const index = typeof body.index === 'number' ? body.index : parseInt(body.index, 10);
@@ -1186,8 +1097,6 @@ async function handleApiKeysPut(req, env) {
 }
 
 async function handleApiKeysDelete(req, env) {
-    if (!await isAuthenticated(req, env)) return jsonResp({ error: 'Unauthorized' }, 401);
-    const kvErr = requireKV(env); if (kvErr) return kvErr;
     const index = parseInt(new URL(req.url).searchParams.get('index'), 10);
     if (isNaN(index) || index < 0) return jsonError('请提供有效的 index 查询参数', 400);
     const keys = await getApiKeys(env);
@@ -1202,8 +1111,6 @@ async function handleApiKeysDelete(req, env) {
 }
 
 async function handleApiKeysVerify(req, env) {
-    if (!await isAuthenticated(req, env)) return jsonResp({ error: 'Unauthorized' }, 401);
-    const kvErr = requireKV(env); if (kvErr) return kvErr;
     const keys = await getApiKeys(env);
     const now = Date.now();
     const results = await Promise.all(keys.map(async key => {
@@ -1233,15 +1140,11 @@ async function handleApiKeysVerify(req, env) {
 }
 
 async function handleRetryConfigGet(req, env) {
-    if (!await isAuthenticated(req, env)) return jsonResp({ error: 'Unauthorized' }, 401);
-    const kvErr = requireKV(env); if (kvErr) return kvErr;
     const minutes = await getRetryMinutes(env);
     return jsonResp({ ok: true, retry_minutes: minutes });
 }
 
 async function handleRetryConfigPut(req, env) {
-    if (!await isAuthenticated(req, env)) return jsonResp({ error: 'Unauthorized' }, 401);
-    const kvErr = requireKV(env); if (kvErr) return kvErr;
     let body = {};
     try { body = await req.json(); } catch { return jsonError('Invalid JSON', 400); }
     const minutes = parseInt(body.retry_minutes, 10);
@@ -1251,8 +1154,6 @@ async function handleRetryConfigPut(req, env) {
 }
 
 async function handleSupportedModelsGet(req, env) {
-    if (!await isAuthenticated(req, env)) return jsonResp({ error: 'Unauthorized' }, 401);
-    const kvErr = requireKV(env); if (kvErr) return kvErr;
     const refresh = new URL(req.url).searchParams.get('refresh') === '1';
     await maybeRefreshSupportedModels(env, refresh);
     let kv = null;
@@ -1276,15 +1177,11 @@ async function handleSupportedModelsGet(req, env) {
 }
 
 async function handlePanelLogs(req, env) {
-    if (!await isAuthenticated(req, env)) return jsonResp({ error: 'Unauthorized' }, 401);
-    const kvErr = requireKV(env); if (kvErr) return kvErr;
     const entries = await getLogs(env);
     return jsonResp({ ok: true, logs: entries });
 }
 
 async function handlePanelLogsClear(req, env) {
-    if (!await isAuthenticated(req, env)) return jsonResp({ error: 'Unauthorized' }, 401);
-    const kvErr = requireKV(env); if (kvErr) return kvErr;
     try {
         await env.GEMINI_KV.put(KV_KEY_LOG_ENTRIES, JSON.stringify([]));
         return jsonResp({ ok: true });
@@ -1379,35 +1276,14 @@ input:focus{border-color:var(--bl);box-shadow:0 0 0 3px rgba(14,165,233,.15)}
 @keyframes slideInRight{from{opacity:0;transform:translateX(20px)}to{opacity:1;transform:translateX(0)}}
 @keyframes pulse{0%,100%{transform:scale(1)}50%{transform:scale(1.05)}}
 @keyframes shimmer{0%{background-position:-200% 0}100%{background-position:200% 0}}
-@keyframes bounce{0%,20%,50%,80%,100%{transform:translateY(0)}40%{transform:translateY(-10px)}60%{transform:translateY(-5px)}}
-@keyframes rotate{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
-@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-5px)}}
-@keyframes shake{0%,100%{transform:translateX(0)}10%,30%,50%,70%,90%{transform:translateX(-5px)}20%,40%,60%,80%{transform:translateX(5px)}}
 
-/* 动画类 */
-.animate-fadeIn{animation:fadeIn .4s ease-out}
-.animate-slideInLeft{animation:slideInLeft .4s ease-out}
-.animate-slideInRight{animation:slideInRight .4s ease-out}
-.animate-pulse{animation:pulse 2s infinite}
-.animate-bounce{animation:bounce 1s}
-.animate-float{animation:float 3s ease-in-out infinite}
-.animate-shake{animation:shake .5s}
+@keyframes float{0%,100%{transform:translateY(0)}50%{transform:translateY(-5px)}}
 
 /* 悬停动画 */
 .card:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,.08)}
 .sc:hover{transform:translateY(-2px);box-shadow:0 4px 12px rgba(0,0,0,.08)}
 .pbox:hover{box-shadow:0 2px 8px rgba(0,0,0,.06)}
 .navtab:hover{animation:pulse .6s}
-
-/* 加载动画 */
-.loading{display:inline-flex;align-items:center;gap:8px}
-.loading::before{content:'';width:16px;height:16px;border:2px solid var(--b2);border-top-color:var(--bl);border-radius:50%;animation:rotate .8s linear infinite}
-
-/* 渐变背景动画 */
-.shimmer{background:linear-gradient(90deg,var(--s2) 25%,var(--s1) 50%,var(--s2) 75%);background-size:200% 100%;animation:shimmer 1.5s infinite}
-
-/* 按钮点击动画 */
-.btn:active{animation:bounce .3s}
 
 /* Nav tabs */
 .navtabs{display:flex;gap:2px;padding:16px 0 0;border-bottom:1px solid var(--b1);background:var(--s1)}
@@ -2542,25 +2418,33 @@ async function handleRequest(request, env, ctx) {
     if (path === '/favicon.ico') {
         return new Response(null, { status: 204 });
     }
+    // 以下路由仅用于面板 UI，无需 API 鉴权
     if (path === '/panel/health'        && method === 'GET')  return handlePanelHealth(request, env);
     if (path === '/panel/login'         && method === 'POST') return handlePanelLogin(request, env);
     if (path === '/panel/logout'        && method === 'POST') return handlePanelLogout(request, env);
-    if (path === '/panel/stats'         && method === 'GET')  return handlePanelStats(request, env);
-    if (path === '/panel/reset'         && method === 'POST') return handlePanelReset(request, env);
-    if (path === '/panel/api-keys'      && method === 'GET')  return handleApiKeysGet(request, env);
-    if (path === '/panel/api-keys'      && method === 'POST') return handleApiKeysPost(request, env);
-    if (path === '/panel/api-keys'      && method === 'PUT')  return handleApiKeysPut(request, env);
-    if (path === '/panel/api-keys'      && method === 'DELETE') return handleApiKeysDelete(request, env);
-    if (path === '/panel/api-keys/verify' && method === 'POST') return handleApiKeysVerify(request, env);
-    if (path === '/panel/tokens'        && method === 'GET')  return handleTokenList(request, env);
-    if (path === '/panel/tokens/create' && method === 'POST') return handleTokenCreate(request, env);
-    if (path === '/panel/tokens/revoke' && method === 'POST') return handleTokenRevoke(request, env);
-    if (path === '/panel/tokens/blocked-models' && method === 'POST') return handleTokenBlockedModels(request, env);
-    if (path === '/panel/retry-config' && method === 'GET') return handleRetryConfigGet(request, env);
-    if (path === '/panel/retry-config' && method === 'PUT') return handleRetryConfigPut(request, env);
-    if (path === '/panel/supported-models' && method === 'GET') return handleSupportedModelsGet(request, env);
-    if (path === '/panel/logs' && method === 'GET') return handlePanelLogs(request, env);
-    if (path === '/panel/logs' && method === 'DELETE') return handlePanelLogsClear(request, env);
+
+    // 受保护路由：统一在此校验会话与 KV 绑定
+    if (path.startsWith('/panel/')) {
+        if (!await isAuthenticated(request, env)) return jsonResp({ ok: false, error: 'Unauthorized' }, 401);
+        const kvErr = requireKV(env); if (kvErr) return kvErr;
+        if (path === '/panel/stats'         && method === 'GET')  return handlePanelStats(request, env);
+        if (path === '/panel/reset'         && method === 'POST') return handlePanelReset(request, env);
+        if (path === '/panel/api-keys'      && method === 'GET')  return handleApiKeysGet(request, env);
+        if (path === '/panel/api-keys'      && method === 'POST') return handleApiKeysPost(request, env);
+        if (path === '/panel/api-keys'      && method === 'PUT')  return handleApiKeysPut(request, env);
+        if (path === '/panel/api-keys'      && method === 'DELETE') return handleApiKeysDelete(request, env);
+        if (path === '/panel/api-keys/verify' && method === 'POST') return handleApiKeysVerify(request, env);
+        if (path === '/panel/tokens'        && method === 'GET')  return handleTokenList(request, env);
+        if (path === '/panel/tokens/create' && method === 'POST') return handleTokenCreate(request, env);
+        if (path === '/panel/tokens/revoke' && method === 'POST') return handleTokenRevoke(request, env);
+        if (path === '/panel/tokens/blocked-models' && method === 'POST') return handleTokenBlockedModels(request, env);
+        if (path === '/panel/retry-config' && method === 'GET') return handleRetryConfigGet(request, env);
+        if (path === '/panel/retry-config' && method === 'PUT') return handleRetryConfigPut(request, env);
+        if (path === '/panel/supported-models' && method === 'GET') return handleSupportedModelsGet(request, env);
+        if (path === '/panel/logs' && method === 'GET') return handlePanelLogs(request, env);
+        if (path === '/panel/logs' && method === 'DELETE') return handlePanelLogsClear(request, env);
+        return jsonError('Not Found', 404);
+    }
 
     // ── API Auth Check ────────────────────────────────────────────────────────
     const authResult = await checkApiAuth(request, env);
@@ -2578,12 +2462,12 @@ async function handleRequest(request, env, ctx) {
     if (path.startsWith('/v1/')) {
         // Map /v1/xxx → /v1beta/openai/xxx
         const geminiPath = '/v1beta/openai' + path.slice(3);   // /v1/chat/completions → /v1beta/openai/chat/completions
-        return proxyToGemini(request, env, geminiPath, 3, ctx, authResult.token);
+        return proxyToGemini(request, env, geminiPath, ctx, authResult.token);
     }
 
     // ── Gemini native endpoint (direct passthrough) ───────────────────────────
     if (path.startsWith('/v1beta/')) {
-        return proxyToGemini(request, env, path, 3, ctx, authResult.token);
+        return proxyToGemini(request, env, path, ctx, authResult.token);
     }
 
     // ── Root info ─────────────────────────────────────────────────────────────
